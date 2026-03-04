@@ -1,0 +1,6 @@
+.env
+logs/
+captures/
+__pycache__/
+.DS_Store
+.claude/
