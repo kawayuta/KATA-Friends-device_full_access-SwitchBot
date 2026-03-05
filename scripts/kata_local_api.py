@@ -22,8 +22,9 @@ from dotenv import load_dotenv
 load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))
 
 KATA_IP = os.environ["KATA_IP"]
-KATA_PORT = 22090
+KATA_PORT = int(os.environ.get("KATA_LOCAL_PORT", "27999"))
 KATA_DEVICE_ID = os.environ["KATA_DEVICE_ID"]
+KATA_LOCAL_TOKEN = os.environ["KATA_LOCAL_TOKEN"]
 BASE_URL = f"http://{KATA_IP}:{KATA_PORT}"
 
 # キャプチャから判明したfunctionID
@@ -33,8 +34,8 @@ FUNC_FACES = 9225
 
 
 def make_auth(body_str: str) -> str:
-    """authヘッダーを生成（推定: bodyのMD5）"""
-    return hashlib.md5(body_str.encode()).hexdigest()
+    """authヘッダーを生成: MD5(body + token)"""
+    return hashlib.md5((body_str + KATA_LOCAL_TOKEN).encode()).hexdigest()
 
 
 def make_request(function_id: int, params: dict = None) -> dict:
@@ -54,41 +55,27 @@ def make_request(function_id: int, params: dict = None) -> dict:
         }
     }
 
-    body_str = json.dumps(payload)
-
-    # auth生成（複数パターンを試す）
-    auth_candidates = [
-        hashlib.md5(body_str.encode()).hexdigest(),
-        hashlib.md5(f"{body_str}{KATA_DEVICE_ID}".encode()).hexdigest(),
-        hashlib.md5(body_str.encode('utf-8')).hexdigest(),
-    ]
+    body_str = json.dumps(payload, separators=(",", ":"))
+    auth = make_auth(body_str)
 
     headers = {
         "Content-Type": "application/json",
         "Accept": "application/json",
         "User-Agent": "SwitchBot/27 CFNetwork/3860.300.31 Darwin/25.2.0",
+        "auth": auth,
     }
 
-    for auth in auth_candidates:
-        headers["auth"] = auth
-        try:
-            resp = httpx.post(
-                f"{BASE_URL}/thing_model/func_request",
-                content=body_str,
-                headers=headers,
-                timeout=5.0,
-            )
-            if resp.status_code == 200:
-                data = resp.json()
-                if data.get("code") == 1:
-                    return data
-                # code != 1 でも返す（エラー内容を見るため）
-                return data
-        except Exception as e:
-            print(f"  接続エラー: {e}")
-            return {}
-
-    return {}
+    try:
+        resp = httpx.post(
+            f"{BASE_URL}/thing_model/func_request",
+            content=body_str,
+            headers=headers,
+            timeout=5.0,
+        )
+        return resp.json()
+    except Exception as e:
+        print(f"  接続エラー: {e}")
+        return {}
 
 
 def discover_functions():
