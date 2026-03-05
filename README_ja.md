@@ -235,17 +235,133 @@ data/
 
 | ポート | サービス | 説明 |
 |---|---|---|
+| 5555 | adbd | ADBデーモン |
+| 5558 | master (ZMQ XPUB) | ZMQサブスクライバーポート（内部IPC） |
+| 5559 | master (ZMQ XSUB) | ZMQパブリッシャーポート（内部IPC、センサーデータ流通） |
 | 8080 | flask_server_action.py | LLMアクション判定。音声テキストを受け取り `mood/instruction` を返す |
 | 8082 | flask_server_diary.py | LLM日記生成。イベントリストから日記を生成 |
 | 8083 | route.py | 統合ルーター。リクエスト内容に応じて8080/8082に振り分け |
-| 27999 | cc_main (C++) | ローカルAPI。写真・顔認識・ストレージ等 (auth必要) |
-| 5555 | adbd | ADBデーモン |
+| 27999 | control_center_runner (C++) | ローカルAPI。写真・顔認識・ストレージ等 (auth必要) |
+| 50001 | control_center_runner (C++) | 不明（外部アクセス可能） |
+
+### 内部IPC (ZeroMQ)
+
+デバイス内部のプロセス間通信にZeroMQ (ZMQ)を使用。`master`プロセスがXPUB/XSUBプロキシとして動作する。
+
+#### ソケット
+
+| ソケット | アドレス | 役割 |
+|---|---|---|
+| XPUB | `tcp://127.0.0.1:5558` | サブスクライバー接続先 |
+| XSUB | `tcp://127.0.0.1:5559` | パブリッシャー接続先 |
+| XPUB (IPC) | `ipc:///dev/shm/ipc.xpub` | IPCサブスクライバーソケット |
+| XSUB (IPC) | `ipc:///dev/shm/ipc.xsub` | IPCパブリッシャーソケット |
+
+注意: IPCソケットファイルは存在しない場合がある。TCP経由のほうが確実。
+
+#### メッセージフォーマット
+
+ZMQマルチパートメッセージ（2フレーム構成）:
+
+1. **フレーム1（トピック）**: `#` + トピック名（例: `#/imu`, `#/agent/start_cc_task`）
+2. **フレーム2（ペイロード）**: MessagePackエンコード（msgpack str8 `\xd9` + 長さ + JSONペイロード）
+
+#### 観測済みトピック（ポート5559）
+
+| トピック | 内容 | データ |
+|---|---|---|
+| `/imu` | IMUセンサーデータ | 加速度計・ジャイロスコープ（imu_linkフレーム） |
+| `/tf` | 座標変換ツリー | odom → base_footprint変換 |
+| `/odom` | オドメトリ | 位置・速度・共分散行列 |
+| `/curr_limb_pose` | 手足の姿勢 | 現在のサーボ/手足の状態 |
+
+#### 制御トピック（バイナリ解析から判明）
+
+| トピック | 用途 |
+|---|---|
+| `/ai/do_action` | アクションのトリガー（ダンス、写真等） |
+| `/ai/mood` | 気分・感情の設定 |
+| `/ai/sound` | サウンド再生 |
+| `/ai/show_eyes` | 目のアニメーション変更 |
+| `/agent/start_cc_task` | コントロールセンタータスクの開始 |
+| `/agent/stop_cc_task` | コントロールセンタータスクの停止 |
+
+#### メッセージの送信
+
+```bash
+# デバイス上でADB経由（pyzmqは未インストール、ctypesまたはスクリプトをpush）
+adb shell
+
+# トピック監視（XPUBポート5558にSUBとして接続）
+# コマンド送信（XSUBポート5559にPUBとして接続）
+```
+
+`/agent/start_cc_task`のメッセージ例:
+```
+フレーム1: b'#/agent/start_cc_task'
+フレーム2: msgpack(json_payload_string)
+```
+
+## アクションの実行方法
+
+Kata Friendsにアクションを実行させる方法は3つある:
+
+### 方法1: LLMアクションサーバー（最も簡単）
+
+自然言語テキストを送ると、デバイス上のLLMがアクションを判定する。**認証不要。**
+
+```bash
+# 基本例
+curl -X POST http://<KATA_IP>:8080/rkllm_action \
+  -H "Content-Type: application/json" \
+  -d '{"voiceText": "踊って"}'
+# レスポンス: happy/dance
+
+# 統合ルーター経由（同じ結果）
+curl -X POST http://<KATA_IP>:8083/rkllm_action \
+  -H "Content-Type: application/json" \
+  -d '{"voiceText": "写真撮って"}'
+# レスポンス: happy/take_photo
+
+# 英語もOK
+curl -X POST http://<KATA_IP>:8080/rkllm_action \
+  -H "Content-Type: application/json" \
+  -d '{"voiceText": "dance please"}'
+```
+
+レスポンス形式: `mood/instruction`（例: `happy/dance`, `neutral/no_action`）
+
+**注意**: これはLLMの*判定結果*を返すだけで、アクション自体は実行しない。実際の実行はZMQトピックをサブスクライブする内部プロセスが行う。
+
+### 方法2: ZMQ IPC（直接制御、調査中）
+
+ADB経由でデバイス内部のZMQトピックに直接パブリッシュする。LLMをバイパスできる。
+
+```bash
+# デバイスに接続
+adb shell
+
+# /ai/do_action トピックにパブリッシュ（ZMQクライアントが必要）
+# メッセージ形式: マルチパート [#/ai/do_action, msgpack(payload)]
+```
+
+状態: メッセージ形式は部分的に判明。制御トピックのペイロード構造は引き続き調査中。
+
+### 方法3: ローカルAPI（認証必要）
+
+データ取得用（写真、顔認識、ストレージ）。アクションのトリガーには使えない。
+
+```bash
+python3 scripts/kata_local_api.py photos    # 写真一覧
+python3 scripts/kata_local_api.py faces     # 顔認識データ
+python3 scripts/kata_local_api.py storage   # ストレージ情報
+```
 
 ## LLMアクションサーバー詳細
 
 ### 概要
 
-音声認識テキストを受け取り、AIペットの反応（感情＋動作）を返す。
+音声認識テキストを受け取り、AIペットの反応（感情＋動作）を返す。Rockchip NPU上でRKLLM（量子化Qwen3 + LoRA SFT）として動作。
 
 ### エンドポイント
 
@@ -258,24 +374,34 @@ Content-Type: application/json
 
 レスポンス: `happy/dance`
 
-### システムプロンプト
+### 利用可能なアクション（全41種）
 
-AIペットとして、音声入力に対して`mood/instruction`形式で応答する。
+| カテゴリ | アクション |
+|---|---|
+| 移動 | `move_forward`, `move_back`, `move_left`, `move_right`, `spin`, `turn_left`, `turn_right`, `come_over`, `go_away`, `follow_me`, `stop` |
+| ナビゲーション | `go_to_kitchen`, `go_to_bedroom`, `go_to_balcony` |
+| 表現 | `dance`, `sing`, `nod`, `shake_head`, `wave_hand` |
+| 視線 | `look_left`, `look_right`, `look_up`, `look_down` |
+| 挨拶 | `good_morning`, `bye`, `good_night`, `say_hello`, `welcome` |
+| 感情表現 | `show_love`, `get_praise` |
+| 機能 | `take_photo`, `go_power`, `go_play`, `go_sleep`, `wake_up` |
+| 音量 | `volume_up`, `volume_down`, `be_silent`, `speak` |
+| その他 | `user_leave`, `no_action` |
 
-**利用可能なアクション**:
-`wave_hand`, `come_over`, `go_power`, `go_play`, `take_photo`, `be_silent`, `nod`, `shake_head`, `dance`, `look_left`, `look_right`, `look_up`, `look_down`, `go_away`, `move_forward`, `move_back`, `move_left`, `move_right`, `spin`, `turn_left`, `turn_right`, `go_to_kitchen`, `go_to_bedroom`, `go_to_balcony`, `good_morning`, `bye`, `good_night`, `follow_me`, `stop`, `go_sleep`, `volume_up`, `volume_down`, `sing`, `speak`, `welcome`, `user_leave`, `no_action`, `say_hello`, `show_love`, `wake_up`, `get_praise`
+### 利用可能な感情（全7種）
 
-**利用可能な感情**:
 `happy`, `angry`, `sad`, `scared`, `disgusted`, `surprised`, `neutral`
 
 ### 判定ルール
 
-- ウェイクワード（hello, niko, noa, kata等）のみ → `neutral/no_action`
-- 背景ノイズ・口癖 → `neutral/no_action`
-- ウェイクワード + 明確な指令 → ウェイクワード無視して実行
-- 褒め言葉（見た目） → `happy/show_love`
-- 褒め言葉（行動） → `happy/get_praise`
-- 叱責 → `angry/no_action` or `sad/stop`
+| 入力 | 結果 |
+|---|---|
+| ウェイクワードのみ（hello, niko, noa, kata） | `neutral/no_action` |
+| 背景ノイズ・口癖 | `neutral/no_action` |
+| ウェイクワード + 明確な指令 | ウェイクワード無視して実行 |
+| 褒め言葉（見た目） | `happy/show_love` |
+| 褒め言葉（行動） | `happy/get_praise` |
+| 叱責 | `angry/no_action` or `sad/stop` |
 
 ## LLM日記サーバー詳細
 

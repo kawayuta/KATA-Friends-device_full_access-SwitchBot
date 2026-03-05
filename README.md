@@ -191,17 +191,133 @@ data/
 
 | Port | Service | Description |
 |---|---|---|
+| 5555 | adbd | ADB daemon |
+| 5558 | master (ZMQ XPUB) | ZMQ subscriber port (internal IPC) |
+| 5559 | master (ZMQ XSUB) | ZMQ publisher port (internal IPC, sensor data flows here) |
 | 8080 | flask_server_action.py | LLM action: takes voice text, returns `mood/instruction` |
 | 8082 | flask_server_diary.py | LLM diary: generates diary from event list |
 | 8083 | route.py | Unified router: auto-detects and routes to 8080/8082 |
-| 27999 | cc_main (C++) | Local API: photos, faces, storage (auth required) |
-| 5555 | adbd | ADB daemon |
+| 27999 | control_center_runner (C++) | Local API: photos, faces, storage (auth required) |
+| 50001 | control_center_runner (C++) | Unknown (externally accessible) |
+
+### Internal IPC (ZeroMQ)
+
+The device uses ZeroMQ (ZMQ) for inter-process communication with a classic XPUB/XSUB proxy pattern. The `master` process acts as the proxy.
+
+#### Sockets
+
+| Socket | Address | Role |
+|---|---|---|
+| XPUB | `tcp://127.0.0.1:5558` | Subscribers connect here |
+| XSUB | `tcp://127.0.0.1:5559` | Publishers connect here |
+| XPUB (IPC) | `ipc:///dev/shm/ipc.xpub` | IPC subscriber socket |
+| XSUB (IPC) | `ipc:///dev/shm/ipc.xsub` | IPC publisher socket |
+
+Note: IPC socket files may not always exist. TCP ports are more reliable.
+
+#### Message Format
+
+ZMQ multipart messages with 2 frames:
+
+1. **Frame 1 (Topic)**: `#` prefix + topic name (e.g., `#/imu`, `#/agent/start_cc_task`)
+2. **Frame 2 (Payload)**: MessagePack-encoded data (msgpack str8 `\xd9` + length + JSON payload)
+
+#### Observed Topics (port 5559)
+
+| Topic | Content | Data |
+|---|---|---|
+| `/imu` | IMU sensor data | Accelerometer, gyroscope (imu_link frame) |
+| `/tf` | Transform tree | odom → base_footprint transforms |
+| `/odom` | Odometry | Position, velocity, covariance matrix |
+| `/curr_limb_pose` | Limb positions | Current servo/limb state |
+
+#### Control Topics (from binary analysis)
+
+| Topic | Purpose |
+|---|---|
+| `/ai/do_action` | Trigger an action (dance, photo, etc.) |
+| `/ai/mood` | Set mood/emotion |
+| `/ai/sound` | Play sound |
+| `/ai/show_eyes` | Change eye animation |
+| `/agent/start_cc_task` | Start a control center task |
+| `/agent/stop_cc_task` | Stop a control center task |
+
+#### Publishing Messages
+
+```bash
+# On-device via ADB (pyzmq not installed, use ctypes or push a script)
+adb shell
+
+# Monitor topics (connect to XPUB port 5558 as SUB)
+# Publish commands (connect to XSUB port 5559 as PUB)
+```
+
+Example message for `/agent/start_cc_task`:
+```
+Frame 1: b'#/agent/start_cc_task'
+Frame 2: msgpack(json_payload_string)
+```
+
+## How to Trigger Actions
+
+There are 3 ways to make Kata Friends perform actions:
+
+### Method 1: LLM Action Server (Easiest)
+
+Send natural language text and the on-device LLM decides the action. **No auth required.**
+
+```bash
+# Basic example
+curl -X POST http://<KATA_IP>:8080/rkllm_action \
+  -H "Content-Type: application/json" \
+  -d '{"voiceText": "dance please"}'
+# Response: happy/dance
+
+# Via the unified router (same result)
+curl -X POST http://<KATA_IP>:8083/rkllm_action \
+  -H "Content-Type: application/json" \
+  -d '{"voiceText": "take a photo"}'
+# Response: happy/take_photo
+
+# Japanese works too
+curl -X POST http://<KATA_IP>:8080/rkllm_action \
+  -H "Content-Type: application/json" \
+  -d '{"voiceText": "踊って"}'
+```
+
+Response format: `mood/instruction` (e.g., `happy/dance`, `neutral/no_action`)
+
+**Important**: This only returns the *decision* — it does NOT execute the action. The actual execution is handled by other internal processes that subscribe to ZMQ topics.
+
+### Method 2: ZMQ IPC (Direct Control, WIP)
+
+Publish directly to internal ZMQ topics from within the device via ADB. This bypasses the LLM entirely.
+
+```bash
+# Connect to device
+adb shell
+
+# Publish to /ai/do_action topic (requires ZMQ client)
+# Message format: multipart [#/ai/do_action, msgpack(payload)]
+```
+
+Status: Message format partially decoded. Payload structure for control topics still under investigation.
+
+### Method 3: Local API (Auth Required)
+
+For data retrieval (photos, faces, storage). Not for triggering actions directly.
+
+```bash
+python3 scripts/kata_local_api.py photos    # Photo list
+python3 scripts/kata_local_api.py faces     # Face recognition data
+python3 scripts/kata_local_api.py storage   # Storage info
+```
 
 ## LLM Action Server
 
 ### Overview
 
-Receives voice recognition text and returns the AI pet's reaction (emotion + action).
+Receives voice recognition text and returns the AI pet's reaction (emotion + action). Runs on the Rockchip NPU using RKLLM (quantized Qwen3 with LoRA SFT).
 
 ### Endpoint
 
@@ -214,13 +330,34 @@ Content-Type: application/json
 
 Response: `happy/dance`
 
-### Available Actions
+### Available Actions (41 total)
 
-`wave_hand`, `come_over`, `go_power`, `go_play`, `take_photo`, `be_silent`, `nod`, `shake_head`, `dance`, `look_left`, `look_right`, `look_up`, `look_down`, `go_away`, `move_forward`, `move_back`, `move_left`, `move_right`, `spin`, `turn_left`, `turn_right`, `go_to_kitchen`, `go_to_bedroom`, `go_to_balcony`, `good_morning`, `bye`, `good_night`, `follow_me`, `stop`, `go_sleep`, `volume_up`, `volume_down`, `sing`, `speak`, `welcome`, `user_leave`, `no_action`, `say_hello`, `show_love`, `wake_up`, `get_praise`
+| Category | Actions |
+|---|---|
+| Movement | `move_forward`, `move_back`, `move_left`, `move_right`, `spin`, `turn_left`, `turn_right`, `come_over`, `go_away`, `follow_me`, `stop` |
+| Navigation | `go_to_kitchen`, `go_to_bedroom`, `go_to_balcony` |
+| Expression | `dance`, `sing`, `nod`, `shake_head`, `wave_hand` |
+| Looking | `look_left`, `look_right`, `look_up`, `look_down` |
+| Greeting | `good_morning`, `bye`, `good_night`, `say_hello`, `welcome` |
+| Emotion | `show_love`, `get_praise` |
+| Function | `take_photo`, `go_power`, `go_play`, `go_sleep`, `wake_up` |
+| Audio | `volume_up`, `volume_down`, `be_silent`, `speak` |
+| Other | `user_leave`, `no_action` |
 
-### Available Emotions
+### Available Emotions (7 total)
 
 `happy`, `angry`, `sad`, `scared`, `disgusted`, `surprised`, `neutral`
+
+### Decision Rules
+
+| Input | Result |
+|---|---|
+| Wake word only (hello, niko, noa, kata) | `neutral/no_action` |
+| Background noise / filler words | `neutral/no_action` |
+| Wake word + clear command | Ignore wake word, execute command |
+| Compliment (appearance) | `happy/show_love` |
+| Compliment (behavior) | `happy/get_praise` |
+| Scolding | `angry/no_action` or `sad/stop` |
 
 ## LLM Diary Server
 

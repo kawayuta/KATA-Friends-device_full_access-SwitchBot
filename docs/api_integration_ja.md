@@ -110,17 +110,20 @@ adb shell    # そのままrootシェルが開く
 | Python | 3.12.3 |
 | Webフレームワーク | Flask (Werkzeug) |
 | LLMランタイム | RKLLM (Rockchip NPU) |
-| チップ | RK3588系 |
+| チップ | RK3576 (Rockchip) |
 
 開放ポート:
 
 | ポート | 用途 |
 |---|---|
 | 5555 | ADB (Android Debug Bridge) |
+| 5558 | ZMQ XPUB（内部IPC、サブスクライバーポート） |
+| 5559 | ZMQ XSUB（内部IPC、パブリッシャーポート、センサーデータ） |
 | 8080 | LLMアクションサーバー (Flask/RKLLM) |
-| 8082 | 不明 |
-| 27999 | ローカルAPI (thing_model) |
-| 50001 | 不明 |
+| 8082 | LLM日記サーバー (Flask/RKLLM) |
+| 8083 | LLM統合ルーター（8080/8082に自動振り分け） |
+| 27999 | ローカルAPI (thing_model、auth必要) |
+| 50001 | control_center_runner（用途不明） |
 
 主要ディレクトリ:
 ```
@@ -135,7 +138,24 @@ adb shell    # そのままrootシェルが開く
 /data/common/resource/          # リソース（目のアニメーション等）
 ```
 
-### 5. BLEアドバタイズ（動作中）
+### 5. 内部IPC — ZeroMQ（発見済み）
+
+デバイス内部のプロセス間通信にZeroMQを使用。`master`プロセスがXPUB/XSUBプロキシとして動作。
+
+| ソケット | アドレス | 役割 |
+|---|---|---|
+| XPUB | `tcp://127.0.0.1:5558` | サブスクライバー接続先 |
+| XSUB | `tcp://127.0.0.1:5559` | パブリッシャー接続先 |
+
+メッセージはZMQマルチパート形式: フレーム1 = `#` + トピック名、フレーム2 = MessagePackエンコードされたJSONペイロード。
+
+**センサートピック**（ポート5559で流通）: `/imu`, `/tf`, `/odom`, `/curr_limb_pose`
+
+**制御トピック**（バイナリ解析から判明）: `/ai/do_action`, `/ai/mood`, `/ai/sound`, `/ai/show_eyes`, `/agent/start_cc_task`, `/agent/stop_cc_task`
+
+XSUBポートにパブリッシュすることで、LLMサーバーやローカルAPIを経由せずに直接アクションをトリガーできる可能性がある。
+
+### 6. BLEアドバタイズ（動作中）
 
 状態変化をパッシブに検知可能。現在のシステムはこの方式で動作。
 
@@ -154,7 +174,7 @@ xxxxxxxxxxxx | 4c | 01 | 2132 | 0010 | 39 | 00
 | 12 | アクションカウンタ | アクション実行ごとにデクリメント |
 | 13 | インタラクションフラグ | 00=待機中, 03=音声応答中 |
 
-### 6. BLE GATT
+### 7. BLE GATT
 
 SwitchBot標準サービス `cba20d00-224d-11e6-9fb8-0002a5d5c51b` を持つ。Writeキャラ（cba20002）とNotifyキャラ（cba20003）あり。通知のプッシュはなくリクエスト-レスポンス型。
 
@@ -168,6 +188,53 @@ SwitchBot標準サービス `cba20d00-224d-11e6-9fb8-0002a5d5c51b` を持つ。W
 | 0x5703 | `05` | 非対応 |
 | 0x5704 | `01 02` | 不明（2バイト応答） |
 | その他 0x5705〜0x57FF | 応答なし | — |
+
+## アクションの実行方法
+
+### LLMサーバー経由（認証不要）
+
+```bash
+# 自然言語を送信 → LLMが mood/instruction を返す
+curl -X POST http://<KATA_IP>:8080/rkllm_action \
+  -H "Content-Type: application/json" \
+  -d '{"voiceText": "踊って"}'
+# レスポンス: happy/dance
+
+# 英語もOK
+curl -X POST http://<KATA_IP>:8080/rkllm_action \
+  -H "Content-Type: application/json" \
+  -d '{"voiceText": "dance please"}'
+```
+
+これはLLMの*判定結果*のみ。実際のアクション実行は内部のZMQ経由で行われる。
+
+ポート8080（直接）、8082（日記）、8083（ルーター）はすべて**認証不要**。
+
+### ZMQ経由（直接制御、調査中）
+
+```bash
+adb shell
+# /ai/do_action に ZMQ XSUB (tcp://127.0.0.1:5559) 経由でパブリッシュ
+# 形式: マルチパート [#/ai/do_action, msgpack(json_payload)]
+```
+
+### 利用可能なアクション（全41種）
+
+| カテゴリ | アクション |
+|---|---|
+| 移動 | `move_forward`, `move_back`, `move_left`, `move_right`, `spin`, `turn_left`, `turn_right`, `come_over`, `go_away`, `follow_me`, `stop` |
+| ナビゲーション | `go_to_kitchen`, `go_to_bedroom`, `go_to_balcony` |
+| 表現 | `dance`, `sing`, `nod`, `shake_head`, `wave_hand` |
+| 視線 | `look_left`, `look_right`, `look_up`, `look_down` |
+| 挨拶 | `good_morning`, `bye`, `good_night`, `say_hello`, `welcome` |
+| 感情表現 | `show_love`, `get_praise` |
+| 機能 | `take_photo`, `go_power`, `go_play`, `go_sleep`, `wake_up` |
+| 音量 | `volume_up`, `volume_down`, `be_silent`, `speak` |
+| その他 | `user_leave`, `no_action` |
+
+### 利用可能な感情（全7種）
+
+`happy`, `angry`, `sad`, `scared`, `disgusted`, `surprised`, `neutral`
 
 ## 現在の検知能力
 
@@ -394,8 +461,10 @@ bash scripts/06_teardown_routing.sh
 
 | アプローチ | 概要 | 難易度 |
 |---|---|---|
+| ZMQアクショントリガー | `/ai/do_action`にZMQ経由でパブリッシュし、直接アクションを実行 | 中 |
+| ZMQメッセージ形式のRE | 制御トピックのMessagePackペイロードを解読し、必要なフィールドを把握 | 中 |
 | Macマイク併用 | BLE検知をトリガーにMacのマイクで録音→Whisper等で音声認識 | 低 |
 | ローカルAPI functionID探索 | `kata_local_api.py discover` で未知のfunctionIDを発見する | 低 |
-| ADB内部調査 | デバイス内のアプリケーションコード・設定ファイルをさらに調査 | 低 |
+| ポート50001の調査 | 外部アクセス可能なポート50001の用途を特定 | 低 |
 | LLMサーバー連携 | ポート8080のRKLLMサーバーに直接コマンドを送信 | 中 |
 | ファームウェア解析 | デバイス内部のバイナリを詳細に解析 | 高 |

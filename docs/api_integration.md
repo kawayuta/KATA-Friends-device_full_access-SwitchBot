@@ -109,17 +109,20 @@ adb shell    # Opens root shell directly
 | Python | 3.12.3 |
 | Web Framework | Flask (Werkzeug) |
 | LLM Runtime | RKLLM (Rockchip NPU) |
-| Chip | RK3588 series |
+| Chip | RK3576 (Rockchip) |
 
 Open Ports:
 
 | Port | Purpose |
 |---|---|
 | 5555 | ADB (Android Debug Bridge) |
+| 5558 | ZMQ XPUB (internal IPC, subscriber port) |
+| 5559 | ZMQ XSUB (internal IPC, publisher port, sensor data) |
 | 8080 | LLM action server (Flask/RKLLM) |
-| 8082 | Unknown |
-| 27999 | Local API (thing_model) |
-| 50001 | Unknown |
+| 8082 | LLM diary server (Flask/RKLLM) |
+| 8083 | LLM unified router (auto-routes to 8080/8082) |
+| 27999 | Local API (thing_model, auth required) |
+| 50001 | control_center_runner (unknown purpose) |
 
 Key directories:
 ```
@@ -134,7 +137,24 @@ Key directories:
 /data/common/resource/          # Resources (eye animations, etc.)
 ```
 
-### 5. BLE Advertisement (Working)
+### 5. Internal IPC — ZeroMQ (Discovered)
+
+The device uses ZeroMQ for inter-process communication. The `master` process runs an XPUB/XSUB proxy.
+
+| Socket | Address | Role |
+|---|---|---|
+| XPUB | `tcp://127.0.0.1:5558` | Subscribers connect here |
+| XSUB | `tcp://127.0.0.1:5559` | Publishers connect here |
+
+Messages are ZMQ multipart: Frame 1 = `#` + topic name, Frame 2 = MessagePack-encoded JSON payload.
+
+**Sensor topics** (flowing on port 5559): `/imu`, `/tf`, `/odom`, `/curr_limb_pose`
+
+**Control topics** (from binary analysis): `/ai/do_action`, `/ai/mood`, `/ai/sound`, `/ai/show_eyes`, `/agent/start_cc_task`, `/agent/stop_cc_task`
+
+Publishing to these topics via XSUB port could allow direct action triggering without the LLM server or local API.
+
+### 6. BLE Advertisement (Working)
 
 State changes can be passively detected. The current system uses this method.
 
@@ -153,7 +173,7 @@ xxxxxxxxxxxx | 4c | 01 | 2132 | 0010 | 39 | 00
 | 12 | Action counter | Decrements on action execution |
 | 13 | Interaction flag | 00=idle, 03=voice responding |
 
-### 6. BLE GATT
+### 7. BLE GATT
 
 Has SwitchBot standard service `cba20d00-224d-11e6-9fb8-0002a5d5c51b`. Write characteristic (cba20002) and Notify characteristic (cba20003) available. No push notifications — request-response only.
 
@@ -167,6 +187,53 @@ Only `0x57` prefix responds (`0x56`, `0x58`, `0x01`, etc. yield nothing). Full 0
 | 0x5703 | `05` | Not supported |
 | 0x5704 | `01 02` | Unknown (2-byte response) |
 | 0x5705-0x57FF | No response | — |
+
+## How to Trigger Actions
+
+### Via LLM Server (No Auth Required)
+
+```bash
+# Send natural language → LLM returns mood/instruction
+curl -X POST http://<KATA_IP>:8080/rkllm_action \
+  -H "Content-Type: application/json" \
+  -d '{"voiceText": "dance please"}'
+# Response: happy/dance
+
+# Japanese
+curl -X POST http://<KATA_IP>:8080/rkllm_action \
+  -H "Content-Type: application/json" \
+  -d '{"voiceText": "踊って"}'
+```
+
+This returns the LLM's *decision* only. The actual action is executed by internal processes via ZMQ.
+
+Ports 8080 (direct), 8082 (diary), 8083 (router) are all **unauthenticated**.
+
+### Via ZMQ (Direct, WIP)
+
+```bash
+adb shell
+# Publish to /ai/do_action via ZMQ XSUB (tcp://127.0.0.1:5559)
+# Format: multipart [#/ai/do_action, msgpack(json_payload)]
+```
+
+### Available Actions (41)
+
+| Category | Actions |
+|---|---|
+| Movement | `move_forward`, `move_back`, `move_left`, `move_right`, `spin`, `turn_left`, `turn_right`, `come_over`, `go_away`, `follow_me`, `stop` |
+| Navigation | `go_to_kitchen`, `go_to_bedroom`, `go_to_balcony` |
+| Expression | `dance`, `sing`, `nod`, `shake_head`, `wave_hand` |
+| Looking | `look_left`, `look_right`, `look_up`, `look_down` |
+| Greeting | `good_morning`, `bye`, `good_night`, `say_hello`, `welcome` |
+| Emotion | `show_love`, `get_praise` |
+| Function | `take_photo`, `go_power`, `go_play`, `go_sleep`, `wake_up` |
+| Audio | `volume_up`, `volume_down`, `be_silent`, `speak` |
+| Other | `user_leave`, `no_action` |
+
+### Available Emotions (7)
+
+`happy`, `angry`, `sad`, `scared`, `disgusted`, `surprised`, `neutral`
 
 ## Current Detection Capabilities
 
@@ -393,8 +460,10 @@ bash scripts/06_teardown_routing.sh
 
 | Approach | Description | Difficulty |
 |---|---|---|
+| ZMQ action triggering | Publish to `/ai/do_action` via ZMQ to directly trigger actions (dance, photo, etc.) | Medium |
+| ZMQ message format RE | Decode the MessagePack payloads for control topics to understand required fields | Medium |
 | Mac microphone | Use BLE detection as trigger to record with Mac's mic → speech recognition via Whisper etc. | Low |
 | Local API functionID scan | Use `kata_local_api.py discover` to find unknown functionIDs | Low |
-| ADB deep investigation | Further explore application code and config files on device | Low |
+| Port 50001 investigation | Determine the purpose of the externally-accessible port 50001 | Low |
 | LLM server integration | Send commands directly to the RKLLM server on port 8080 | Medium |
 | Firmware analysis | Detailed analysis of device binaries | High |
