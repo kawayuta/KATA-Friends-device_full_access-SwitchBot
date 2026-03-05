@@ -565,14 +565,211 @@ if __name__ == "__main__":
             lock.release()
             is_blocking = False
 
-    # === VLM endpoint (uses C++ demo binary for image+text) ===
-    VLM_DEMO = "/data/rknn-llm/examples/multimodal_model_demo/deploy/install/demo_Linux_aarch64/demo"
+    # === VLM: Vision encoder via RKNN + persistent LLM model ===
     VLM_VISION = "/data/ai_brain/vlm/qwen3-vl-2b_vision_rk3576.rknn"
-    VLM_LLM = "/data/ai_brain/vlm/qwen3-vl-2b-instruct_w4a16_g128_rk3576.rkllm"
+
+    # RKNN API for vision encoder (separate from rkllm for LLM)
+    RKNN_LIB_PATH = "/app/opt/wlab/sweepbot/lib/librknnrt.so"
+
+    # RKNN constants
+    RKNN_TENSOR_UINT8 = 3
+    RKNN_TENSOR_NHWC = 1
+    RKNN_QUERY_IN_OUT_NUM = 0
+    RKNN_QUERY_INPUT_ATTR = 1
+    RKNN_QUERY_OUTPUT_ATTR = 2
+    RKNN_NPU_CORE_0_1 = 3
+
+    class RKNNInputOutputNum(ctypes.Structure):
+        _fields_ = [("n_input", ctypes.c_uint32), ("n_output", ctypes.c_uint32)]
+
+    RKNN_MAX_DIMS = 16
+    RKNN_MAX_NAME_LEN = 256
+
+    class RKNNTensorAttr(ctypes.Structure):
+        _fields_ = [
+            ("index", ctypes.c_uint32),
+            ("n_dims", ctypes.c_uint32),
+            ("dims", ctypes.c_uint32 * RKNN_MAX_DIMS),
+            ("name", ctypes.c_char * RKNN_MAX_NAME_LEN),
+            ("n_elems", ctypes.c_uint32),
+            ("size", ctypes.c_uint32),
+            ("fmt", ctypes.c_int),   # rknn_tensor_format
+            ("type", ctypes.c_int),  # rknn_tensor_type
+            ("qnt_type", ctypes.c_int),
+            ("fl", ctypes.c_int8),
+            ("zp", ctypes.c_int32),
+            ("scale", ctypes.c_float),
+            ("w_stride", ctypes.c_uint32),
+            ("size_with_stride", ctypes.c_uint32),
+            ("pass_through", ctypes.c_uint8),
+            ("h_stride", ctypes.c_uint32),
+        ]
+
+    class RKNNInput(ctypes.Structure):
+        _fields_ = [
+            ("index", ctypes.c_uint32),
+            ("buf", ctypes.c_void_p),
+            ("size", ctypes.c_uint32),
+            ("pass_through", ctypes.c_uint8),
+            ("type", ctypes.c_int),
+            ("fmt", ctypes.c_int),
+        ]
+
+    class RKNNOutput(ctypes.Structure):
+        _fields_ = [
+            ("want_float", ctypes.c_uint8),
+            ("is_prealloc", ctypes.c_uint8),
+            ("index", ctypes.c_uint32),
+            ("buf", ctypes.c_void_p),
+            ("size", ctypes.c_uint32),
+        ]
+
+    VISION_ENCODER = None  # loaded once, kept resident
+
+    def _init_vision_encoder():
+        """Load the vision encoder (.rknn) once via librknnrt.so."""
+        global VISION_ENCODER
+        if VISION_ENCODER is not None:
+            return VISION_ENCODER
+        if not os.path.exists(VLM_VISION):
+            logger.error(f"[VLM] Vision model not found: {VLM_VISION}")
+            return None
+        try:
+            rknn_rt = ctypes.CDLL(RKNN_LIB_PATH)
+        except OSError as e:
+            logger.error(f"[VLM] Cannot load librknnrt.so: {e}")
+            return None
+
+        ctx = ctypes.c_uint64(0)
+        ret = rknn_rt.rknn_init(ctypes.byref(ctx), VLM_VISION.encode(), ctypes.c_uint32(0),
+                                ctypes.c_uint32(0), ctypes.c_void_p(None))
+        if ret != 0:
+            logger.error(f"[VLM] rknn_init failed: {ret}")
+            return None
+        logger.info(f"[VLM] Vision encoder loaded. ctx={ctx.value}")
+
+        # Set dual-core
+        rknn_rt.rknn_set_core_mask(ctx, ctypes.c_int(RKNN_NPU_CORE_0_1))
+
+        # Query IO num
+        io_num = RKNNInputOutputNum()
+        rknn_rt.rknn_query(ctx, ctypes.c_int(RKNN_QUERY_IN_OUT_NUM),
+                           ctypes.byref(io_num), ctypes.c_uint32(ctypes.sizeof(io_num)))
+        logger.info(f"[VLM] Vision encoder: {io_num.n_input} inputs, {io_num.n_output} outputs")
+
+        # Query input attrs
+        in_attr = RKNNTensorAttr()
+        in_attr.index = 0
+        rknn_rt.rknn_query(ctx, ctypes.c_int(RKNN_QUERY_INPUT_ATTR),
+                           ctypes.byref(in_attr), ctypes.c_uint32(ctypes.sizeof(in_attr)))
+        # NHWC format
+        model_h = in_attr.dims[1]
+        model_w = in_attr.dims[2]
+        model_c = in_attr.dims[3]
+        logger.info(f"[VLM] Vision input: {model_h}x{model_w}x{model_c}")
+
+        # Query output attrs
+        out_attrs = []
+        n_image_tokens = 0
+        embed_size = 0
+        for i in range(io_num.n_output):
+            oa = RKNNTensorAttr()
+            oa.index = i
+            rknn_rt.rknn_query(ctx, ctypes.c_int(RKNN_QUERY_OUTPUT_ATTR),
+                               ctypes.byref(oa), ctypes.c_uint32(ctypes.sizeof(oa)))
+            out_attrs.append(oa)
+            if i == 0:
+                for d in range(4):
+                    if oa.dims[d] > 1:
+                        n_image_tokens = oa.dims[d]
+                        embed_size = oa.dims[d + 1]
+                        break
+        logger.info(f"[VLM] n_image_tokens={n_image_tokens}, embed_size={embed_size}, n_output={io_num.n_output}")
+
+        VISION_ENCODER = {
+            "lib": rknn_rt,
+            "ctx": ctx,
+            "model_h": model_h,
+            "model_w": model_w,
+            "model_c": model_c,
+            "n_output": io_num.n_output,
+            "n_image_tokens": n_image_tokens,
+            "embed_size": embed_size,
+        }
+        return VISION_ENCODER
+
+    def _run_vision_encoder(ve, rgb_bytes):
+        """Run vision encoder on raw RGB bytes, return float embeddings."""
+        ctx = ve["ctx"]
+        lib = ve["lib"]
+        n_out = ve["n_output"]
+        n_tokens = ve["n_image_tokens"]
+        embed_sz = ve["embed_size"]
+        img_size = ve["model_h"] * ve["model_w"] * ve["model_c"]
+
+        # Set input
+        inp = RKNNInput()
+        ctypes.memset(ctypes.byref(inp), 0, ctypes.sizeof(inp))
+        inp.index = 0
+        inp.type = RKNN_TENSOR_UINT8
+        inp.fmt = RKNN_TENSOR_NHWC
+        inp.size = img_size
+        buf = (ctypes.c_uint8 * img_size).from_buffer_copy(rgb_bytes)
+        inp.buf = ctypes.cast(buf, ctypes.c_void_p)
+
+        ret = lib.rknn_inputs_set(ctx, ctypes.c_uint32(1), ctypes.byref(inp))
+        if ret < 0:
+            logger.error(f"[VLM] rknn_inputs_set failed: {ret}")
+            return None
+
+        # Run
+        ret = lib.rknn_run(ctx, ctypes.c_void_p(None))
+        if ret < 0:
+            logger.error(f"[VLM] rknn_run failed: {ret}")
+            return None
+
+        # Get outputs
+        OutputArray = RKNNOutput * n_out
+        outputs = OutputArray()
+        for j in range(n_out):
+            outputs[j].want_float = 1
+        ret = lib.rknn_outputs_get(ctx, ctypes.c_uint32(n_out), outputs, ctypes.c_void_p(None))
+        if ret < 0:
+            logger.error(f"[VLM] rknn_outputs_get failed: {ret}")
+            return None
+
+        # Concat outputs: for each token, concat all output layers
+        total_floats = n_tokens * embed_sz * n_out
+        result = (ctypes.c_float * total_floats)()
+
+        if n_out == 1:
+            ctypes.memmove(result, outputs[0].buf, outputs[0].size)
+        else:
+            for i in range(n_tokens):
+                for j in range(n_out):
+                    src_offset = i * embed_sz
+                    dst_offset = i * n_out * embed_sz + j * embed_sz
+                    ctypes.memmove(
+                        ctypes.addressof(result) + dst_offset * 4,
+                        outputs[j].buf + src_offset * 4,
+                        embed_sz * 4
+                    )
+
+        lib.rknn_outputs_release(ctx, ctypes.c_uint32(n_out), outputs)
+        return result, total_floats
+
+    # Pre-load vision encoder at startup
+    _init_vision_encoder()
 
     @app.route("/rkllm_vlm", methods=["POST"])
     def vlm_endpoint():
-        """VLM inference via C++ demo binary. Accepts image + text prompt."""
+        """VLM inference: vision encoder (RKNN) + persistent LLM (RKLLM).
+
+        The vision encoder runs on RKNN to produce image embeddings,
+        which are then passed to the already-loaded LLM via RKLLM_INPUT_MULTIMODAL.
+        No model reload needed.
+        """
+        global is_blocking, global_text, global_state, PERSISTENT_MODEL
         import base64 as b64mod
         body = request.get_json(silent=True) or {}
         vlm_prompt = body.get("prompt", "").strip()
@@ -592,44 +789,97 @@ if __name__ == "__main__":
         else:
             return "image_base64 or image_path is required", 400
 
-        if not os.path.exists(VLM_DEMO):
-            return f"VLM demo binary not found: {VLM_DEMO}", 500
+        # Init vision encoder if not already loaded
+        ve = _init_vision_encoder()
+        if ve is None:
+            return "Vision encoder not available", 500
+        if PERSISTENT_MODEL is None:
+            return "LLM model not loaded", 500
 
-        env = os.environ.copy()
-        env["LD_LIBRARY_PATH"] = os.path.dirname(VLM_DEMO) + "/lib:" + env.get("LD_LIBRARY_PATH", "")
-
+        lock.acquire()
         try:
-            proc = subprocess.Popen(
-                [VLM_DEMO, img_file, VLM_VISION, VLM_LLM,
-                 str(max_new_tokens), "4096", "2",
-                 "<|vision_start|>", "<|vision_end|>", "<|image_pad|>"],
-                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                env=env, cwd=os.path.dirname(VLM_DEMO))
-            stdin_data = vlm_prompt + "\nexit\n"
-            stdout, stderr = proc.communicate(input=stdin_data.encode(), timeout=180)
-            output = stdout.decode("utf-8", errors="replace")
-            lines = output.split("\n")
-            result_lines = []
-            capture = False
-            for line in lines:
-                if line.startswith("robot:"):
-                    capture = True
-                    result_lines.append(line[len("robot:"):].strip())
-                elif capture:
-                    if line.startswith("user:") or line.strip() == "exit":
-                        break
-                    result_lines.append(line)
-            result_text = "\n".join(result_lines).strip()
-            if not result_text:
-                result_text = output
-            logger.info(f"[VLM] Result: {result_text[:200]}")
-            return Response(result_text, status=200, mimetype="text/plain")
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            return "VLM inference timeout", 504
+            if is_blocking:
+                return jsonify({'resultCode': 503, 'message': 'Server busy'}), 503
+            is_blocking = True
+
+            model_h = ve["model_h"]
+            model_w = ve["model_w"]
+
+            # Decode + resize image to model dimensions using ffmpeg (no PIL/numpy needed)
+            try:
+                ffmpeg_proc = subprocess.run(
+                    ["ffmpeg", "-loglevel", "error",
+                     "-i", img_file,
+                     "-vf", f"scale={model_w}:{model_h}:force_original_aspect_ratio=decrease,"
+                            f"pad={model_w}:{model_h}:(ow-iw)/2:(oh-ih)/2:color=0x7f7f7f",
+                     "-pix_fmt", "rgb24", "-f", "rawvideo", "-"],
+                    capture_output=True, timeout=10)
+                rgb_bytes = ffmpeg_proc.stdout
+                expected = model_h * model_w * 3
+                if len(rgb_bytes) != expected:
+                    return f"Image preprocessing failed: got {len(rgb_bytes)} bytes, expected {expected}", 500
+            except Exception as e:
+                return f"Image preprocessing error: {e}", 500
+
+            # Run vision encoder
+            logger.info("[VLM] Running vision encoder...")
+            enc_result = _run_vision_encoder(ve, rgb_bytes)
+            if enc_result is None:
+                return "Vision encoder failed", 500
+            img_embed, total_floats = enc_result
+            logger.info(f"[VLM] Vision encoder done. {total_floats} floats")
+
+            # Prepare multimodal input for LLM
+            prompt_with_tag = f"<image>{vlm_prompt}"
+
+            rkllm_input = RKLLMInput()
+            rkllm_input.role = "user".encode('utf-8')
+            rkllm_input.enable_thinking = ctypes.c_bool(False)
+            rkllm_input.input_type = RKLLMInputType.RKLLM_INPUT_MULTIMODAL
+            rkllm_input.input_data.multimodal_input.prompt = prompt_with_tag.encode('utf-8')
+            rkllm_input.input_data.multimodal_input.image_embed = ctypes.cast(
+                img_embed, ctypes.POINTER(ctypes.c_float))
+            rkllm_input.input_data.multimodal_input.n_image_tokens = ve["n_image_tokens"]
+            rkllm_input.input_data.multimodal_input.n_image = 1
+            rkllm_input.input_data.multimodal_input.image_width = model_w
+            rkllm_input.input_data.multimodal_input.image_height = model_h
+
+            global_text = []
+            global_state = -1
+
+            # Run LLM inference (reusing persistent model)
+            logger.info("[VLM] Running LLM inference...")
+            model_thread = threading.Thread(
+                target=lambda: PERSISTENT_MODEL["run"](
+                    PERSISTENT_MODEL["handle"],
+                    ctypes.byref(rkllm_input),
+                    ctypes.byref(PERSISTENT_MODEL["infer_params"]),
+                    None
+                )
+            )
+            model_thread.start()
+
+            model_output = ""
+            while True:
+                while len(global_text) > 0:
+                    model_output += global_text.pop(0)
+                    time.sleep(0.005)
+                model_thread.join(timeout=0.005)
+                if not model_thread.is_alive():
+                    break
+
+            model_output = model_output.strip()
+            model_output = re.sub(r'<think>.*?</think>', '', model_output, flags=re.DOTALL).strip()
+
+            logger.info(f"[VLM] Result: {model_output[:200]}")
+            return Response(model_output, status=200, mimetype="text/plain")
+
         except Exception as e:
             logger.error(f"[VLM] Error: {e}")
             return f"VLM error: {e}", 500
+        finally:
+            is_blocking = False
+            lock.release()
 
     app.run(host='0.0.0.0', port=8082, threaded=True, debug=False)
     print("====== FLASK SERVER DIARY ======")
