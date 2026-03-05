@@ -1,400 +1,364 @@
 English | **[日本語](README_ja.md)**
 
-# Kata Friends Home API Integration
+# Kata Friends Device Internals
 
-A system that detects SwitchBot Kata Friends events via BLE and forwards them to a home API server.
-Local API authentication has been reverse-engineered, enabling access to photos and face recognition data.
+Documentation of the device's internal structure discovered via ADB.
 
-## Device Info
+## How to Connect
+
+```bash
+# Install adb (first time only)
+brew install android-platform-tools
+
+# Connect (no auth required, root access)
+adb connect <KATA_IP>:5555
+
+# Open shell
+adb shell
+```
+
+Available anytime the device is on Wi-Fi. No SwitchBot app required.
+
+## Hardware
 
 | Item | Value |
 |---|---|
-| Device Name | KATA Friends |
-| BLE Name | WoAIPE (WonderLabs AI Pet) |
-| Manufacturer | Woan Technology (Shenzhen) |
-| BLE Manufacturer ID | 2409 (SwitchBot/WonderLabs) |
-| SwitchBot API deviceId | See .env |
-| Wi-Fi IP | See .env |
-| Wi-Fi | Connected to 2.4GHz band |
-| OS | Linux 6.1.99 aarch64 (Android-based, hostname: WlabRobot) |
-| QR Code (back panel) | Present (manufacturing serial number) |
+| CPU | ARM Cortex-A53 x4 (ARMv8-A) |
+| Chip | Rockchip RK3576 |
+| NPU | RKNN (Rockchip Neural Network) |
+| RAM | 7.7GB |
+| Storage | 28GB (/data) + SD card slot (/media/mmcblk1p1) |
+| OS | Linux 6.1.99 aarch64 (Debian-based) |
+| Hostname | WlabRobot |
+| Python | 3.12.3 |
 
-## Findings
-
-### 1. Wi-Fi Traffic
-
-Almost no internet communication. Voice recognition and camera results are not sent to the cloud.
-
-### 2. SwitchBot Official API (v1.1)
-
-| Endpoint | Result |
-|---|---|
-| `GET /v1.1/devices` | Listed as "KATA Friends", but `deviceType` field is missing (present for other devices) |
-| `GET /v1.1/devices/{id}/status` | `statusCode: 100` (success) but body is empty `{}` |
-| Webhook | Registration succeeds but no events are sent from Kata Friends |
-
-Auth: HMAC-SHA256 signature (implemented in `setup_webhook.py`)
-
-### 3. Local API (Auth Solved)
-
-Kata Friends runs an HTTP server on LAN. The port is dynamically assigned via MQTT.
-
-| Item | Value |
-|---|---|
-| Endpoint | `POST /thing_model/func_request` |
-| Health check | `POST /heartbeat` |
-| Port | 27999 (dynamically distributed via MQTT; was previously 22090) |
-| Auth | `auth: MD5(body + token)` |
-| Token | Distributed via MQTT (stored in .env) |
-| Status | **Working** |
-
-#### Authentication Method
+## Filesystem Overview
 
 ```
-auth = MD5(request_body + token)
+/
+├── app/          196MB  Application (tmpfs overlay)
+├── data/         8.5GB  User data, cache, AI models
+├── rom/          1.5GB  Read-only filesystem
+├── usr/          1.3GB  System binaries
+├── media/        517MB  SD card
+├── opt/          195MB  Additional packages
+└── overlay/      229MB  Overlay FS
 ```
 
-- The token is a UUID distributed by the device to SwitchBot cloud via MQTT
-- Retrieved via ADB from device logs: `cc_mqtt.*.log`, `functionID:1021` messages
-- For empty body (heartbeat): `auth = MD5(token)`
+## Application Structure
 
-#### How Auth Was Reverse-Engineered
+### Main App: `/app/opt/wlab/sweepbot/`
 
-1. Captured iPhone app traffic via mitmproxy — confirmed auth header is MD5 format (32 hex chars)
-2. Heartbeat requests (empty body) always produce the same auth — ruled out timestamp-based generation
-3. Connected via ADB (port 5555 open) with root access — found token in device logs
-4. Verified `auth = MD5(body + token)` matches all captured requests
+```
+sweepbot/
+├── bin/              # Executables (69 files)
+│   ├── master        # Main process (395KB)
+│   ├── media         # Media handling (1.2MB)
+│   ├── pet_voice     # Voice processing (985KB)
+│   ├── recorder      # Recording service (591KB)
+│   ├── rknn_server   # Neural network inference (455KB)
+│   ├── uart_ota      # OTA updates
+│   │
+│   │   # Python/Flask servers
+│   ├── flask_server_action.py  # LLM action server (port 8080)
+│   ├── flask_server_diary.py   # LLM diary server (port 8082)
+│   ├── route.py                # Unified router (port 8083)
+│   │
+│   │   # Shell scripts (35 files)
+│   ├── rknn_server.sh
+│   ├── llm_action_server.sh
+│   └── ...
+│
+├── config/           # Per-model device configs
+│   ├── K20/ K20Pro/ S1/ S1+/ S10/ S20/ S20mini/ A01/
+│   └── *.lua         # SLAM configs
+│
+├── lib/              # Shared libraries
+│   ├── libonnxruntime.so   # ML inference (13MB)
+│   ├── libmosquitto.so     # MQTT client
+│   ├── librkllmrt.so       # RKLLM inference runtime
+│   └── ai_brain/ bt_bridge/ control_center/ lds_slam/
+│
+└── share/            # Resources & model configs
+    └── llm_server/res/
+        ├── action_system_prompt.txt
+        ├── system_prompt_diary.txt
+        └── system_prompt_diary_translation.txt
+```
 
-#### Available Functions
+## AI Models
 
-| functionID | Function | Status |
+### LLM (Large Language Models)
+
+Stored in `/data/ai_brain/`.
+
+| Model | Path | Size | Purpose |
+|---|---|---|---|
+| Qwen3-1.7B | `Qwen3-1.7B_w8a8_RK3576_v3.rkllm` | 2.2GB | Diary generation |
+| Action Model (Qwen3 LoRA SFT) | `qwen3_v7.0.2_lora_sft_nothink_*.rkllm` | 900MB | Action classification |
+| Action Model v1.1 | `actionmodel_w8a8_RK3576_v1.1.rkllm` | 900MB | Legacy action model |
+
+Symlinks:
+- `actionmodel.rkllm` → latest action model
+- `diarymodel.rkllm` → Qwen3-1.7B
+
+### Voice Recognition Models
+
+Stored in `/data/ai_brain/voice/`.
+
+| Model | File | Purpose |
 |---|---|---|
-| 9206 | Storage info | Verified (64MB total, 2MB used) |
-| 9217 | Photo timeline (with face recognition) | Verified (176 photos retrieved) |
-| 9225 | Face recognition data (registered/unregistered) | Verified (3 registered + 16 unregistered) |
+| VAD | `vad/silero_vad.onnx` | Voice Activity Detection |
+| KWS | `kws/encoder.onnx`, `decoder.onnx`, `joiner.onnx` | Keyword Spotting (wake words) |
+| SenseVoice | `sensevoice/model.rknn` | Speech Recognition (ASR) |
 
-Request format:
-```json
+Wake words defined in `kws/keywords.txt`.
+
+### Face Recognition
+
+Binary feature vectors stored in `/data/ai_brain_data/face_metadata/`.
+
+## Data Storage
+
+### `/data/` Directory (8.5GB)
+
+```
+data/
+├── ai_brain/              # AI models (5GB+)
+│   ├── *.rkllm            # LLM models
+│   ├── voice/             # Voice models (VAD, KWS, SenseVoice)
+│   └── model_version.json # Model version management
+│
+├── ai_brain_data/         # AI runtime data (19MB)
+│   └── face_metadata/
+│       ├── known/         # Registered faces (ID_*/)
+│       │   └── ID_xxx/
+│       │       ├── enrolled_faces/   # Registration photos (.jpg)
+│       │       ├── features/         # Face feature vectors (.bin, 2KB each)
+│       │       └── recognized_faces/ # Recognized photos (.jpg)
+│       └── unknown/       # Unregistered faces
+│
+├── control_center/        # Main control data
+│   ├── db/sqlite.db       # SQLite database
+│   ├── maps/              # Navigation maps
+│   ├── ai_images/         # AI-generated images
+│   └── task/              # Task management
+│
+├── cache/                 # Cache (835MB)
+│   ├── log/               # Log files (40+)
+│   ├── image_recorder_archive/  # Captured photos
+│   ├── video_recorder_archive/  # Recorded videos
+│   └── vad/               # VAD cache
+│
+├── common/                # Shared resources (2.1GB)
+│   └── resource/
+│       ├── pink/          # Default theme
+│       │   ├── actions/   # Action files (169, .act)
+│       │   └── eyes/      # Eye animations (PNG, L/R)
+│       ├── blue/          # Blue theme
+│       ├── black/         # Black theme
+│       ├── limbs/         # Limb data
+│       ├── wheels/        # Wheel data
+│       └── sounds/        # Sound effects
+│
+├── map_server/            # SLAM navigation
+└── slam/                  # SLAM debug data
+```
+
+## Internal Services
+
+### systemd Services (28)
+
+| Service | Function |
+|---|---|
+| `master.service` | Main process controller |
+| `ai_brain.service` | AI brain (recognition/decision) |
+| `rknn_server.service` | Neural network inference |
+| `llm_action.service` | LLM action classification (port 8080) |
+| `llm_diary.service` | LLM diary generation (port 8082) |
+| `llm_route.service` | LLM router (port 8083) |
+| `media.service` | Media processing |
+| `pet_voice.service` | Voice processing |
+| `petbot_eye.service` | Eye animations |
+| `recorder.service` | Recording |
+| `slam.service` | SLAM (mapping/localization) |
+| `bt_bridge.service` | Bluetooth |
+| `network_monitor.service` | Network monitoring |
+| `upload_image/video/audio.service` | Cloud upload |
+| `update-robotic.service` | OTA updates |
+
+### Internal HTTP Servers
+
+| Port | Service | Description |
+|---|---|---|
+| 8080 | flask_server_action.py | LLM action: takes voice text, returns `mood/instruction` |
+| 8082 | flask_server_diary.py | LLM diary: generates diary from event list |
+| 8083 | route.py | Unified router: auto-detects and routes to 8080/8082 |
+| 27999 | cc_main (C++) | Local API: photos, faces, storage (auth required) |
+| 5555 | adbd | ADB daemon |
+
+## LLM Action Server
+
+### Overview
+
+Receives voice recognition text and returns the AI pet's reaction (emotion + action).
+
+### Endpoint
+
+```
+POST http://<KATA_IP>:8080/rkllm_action
+Content-Type: application/json
+
+{"voiceText": "dance please"}
+```
+
+Response: `happy/dance`
+
+### Available Actions
+
+`wave_hand`, `come_over`, `go_power`, `go_play`, `take_photo`, `be_silent`, `nod`, `shake_head`, `dance`, `look_left`, `look_right`, `look_up`, `look_down`, `go_away`, `move_forward`, `move_back`, `move_left`, `move_right`, `spin`, `turn_left`, `turn_right`, `go_to_kitchen`, `go_to_bedroom`, `go_to_balcony`, `good_morning`, `bye`, `good_night`, `follow_me`, `stop`, `go_sleep`, `volume_up`, `volume_down`, `sing`, `speak`, `welcome`, `user_leave`, `no_action`, `say_hello`, `show_love`, `wake_up`, `get_praise`
+
+### Available Emotions
+
+`happy`, `angry`, `sad`, `scared`, `disgusted`, `surprised`, `neutral`
+
+## LLM Diary Server
+
+### Overview
+
+Generates a first-person diary entry from the day's interaction events, written in Pixar-style warm narrative.
+
+### Endpoint
+
+```
+POST http://<KATA_IP>:8082/rkllm_diary
+Content-Type: application/json
+
 {
-  "version": "1",
-  "code": 3,
-  "deviceID": "<KATA_DEVICE_ID>",
-  "payload": {
-    "functionID": 9206,
-    "requestID": "UUID",
-    "timestamp": 1709500000000,
-    "params": {}
-  }
+  "task": "diary",
+  "prompt": "language:Chinese\nlocal_date:2026-03-05\nevents:\n08:00 - Woke up\n19:15 - Got ear scratches"
 }
 ```
 
-### 4. Device Internals (via ADB)
+Response: `Title/Diary content/Emotion`
 
-ADB debugging is always enabled on port 5555 with no authentication required. Root shell access is available directly from Mac — no SwitchBot app or proxy needed. Just requires the device to be on the same Wi-Fi network.
+### Diary Emotions
 
-```bash
-# Install adb if needed
-brew install android-platform-tools
+`Happy`, `Excited`, `Relaxed`, `Curious`, `Loved`, `Sleepy`, `Sad`, `Scared`, `Angry`, `Lonely`
 
-# Connect (no auth, root access)
-adb connect <KATA_IP>:5555
-adb shell    # Opens root shell directly
+## Face Recognition Data
+
+### Directory Structure
+
+```
+/data/ai_brain_data/face_metadata/
+├── known/                     # Registered
+│   └── ID_<timestamp>/
+│       ├── enrolled_faces/   # Registration photos (.jpg)
+│       ├── features/         # Face feature vectors (.bin, 2056B each)
+│       └── recognized_faces/ # Recognition history (.jpg)
+└── unknown/                   # Unregistered
+    └── <timestamp>/
+        ├── enrolled_faces/
+        └── features/
 ```
 
-| Item | Value |
+### Access Methods
+
+```bash
+# List registered faces
+adb shell "ls /data/ai_brain_data/face_metadata/known/"
+
+# Download face photos to Mac
+adb pull /data/ai_brain_data/face_metadata/known/ID_xxx/enrolled_faces/
+
+# Also available via local API
+python3 scripts/kata_local_api.py faces
+```
+
+## Photos & Videos
+
+```bash
+# Photo list via local API
+python3 scripts/kata_local_api.py photos
+
+# Download photos via ADB
+adb pull /data/cache/image_recorder_archive/ ./kata_photos/
+
+# Download videos via ADB
+adb pull /data/cache/video_recorder_archive/ ./kata_videos/
+```
+
+## Logs
+
+### Log Files
+
+40+ log files in `/data/cache/log/`.
+
+| Log | Content |
 |---|---|
-| OS | Linux 6.1.99 aarch64 (Debian-based) |
-| Hostname | WlabRobot |
-| User | root |
-| Python | 3.12.3 |
-| Web Framework | Flask (Werkzeug) |
-| LLM Runtime | RKLLM (Rockchip NPU) |
-| Chip | RK3588 series |
+| `cc_main.*.log` | Main process (auth, events) |
+| `cc_mqtt.*.log` | MQTT (tokens, properties) |
+| `cc_bt.*.log` | Bluetooth (BLE advertisements) |
+| `rkllm_action_server.log` | LLM action inference |
+| `rkllm_server.log` | LLM router |
+| `wpa_supplicant.log` | WiFi connection |
 
-Open Ports:
+### Real-time Log Monitoring
 
-| Port | Purpose |
+```bash
+adb shell "tail -f /data/cache/log/cc_main.*.log"      # Main process
+adb shell "tail -f /data/cache/log/cc_mqtt.*.log"       # MQTT
+adb shell "tail -f /data/cache/log/rkllm_action_server.log"  # LLM
+```
+
+## Resource Files
+
+### Themes
+
+3 color themes in `/data/common/resource/`: pink (default), blue, black.
+
+Each contains:
+- `actions/` — 169 action files (`.act` format)
+- `eyes/` — Eye animation frames (PNG, separate L/R)
+
+### Actions (169 files)
+
+| Prefix | Meaning | Example |
+|---|---|---|
+| `RDANCE` | Dance | `RDANCE008.act` |
+| `RKATA` | Kata-specific | `RKATA1.act` ~ `RKATA6.act` |
+| `RSING` | Sing | `RSING001.act` |
+| `RSLEEP` | Sleep | `RSLEEP000.act` |
+| `RMAP` | Map navigation | `RMAPGO.act` |
+| `RPIC` | Take photo | `RPIC001.act` |
+| `RW*` | Walking | `RWF001.act`, `RWL.act`, `RWR.act` |
+
+## SQLite Database
+
+`/data/control_center/db/sqlite.db`
+
+No sqlite3 on device — download to Mac to inspect:
+
+```bash
+adb pull /data/control_center/db/sqlite.db ./
+sqlite3 sqlite.db ".tables"
+sqlite3 sqlite.db ".schema"
+```
+
+## Quick Reference: How to Access Data
+
+| Data | Method |
 |---|---|
-| 5555 | ADB (Android Debug Bridge) |
-| 8080 | LLM action server (Flask/RKLLM) |
-| 8082 | Unknown |
-| 27999 | Local API (thing_model) |
-| 50001 | Unknown |
-
-Key directories:
-```
-/app/opt/wlab/sweepbot/bin/     # Main application
-  flask_server_action.py        # LLM action server (port 8080)
-  flask_server_diary.py         # Diary server
-  route.py                      # Routing
-/data/cache/log/                # Logs
-  cc_main.*.log                 # Main process logs (auth verification, etc.)
-  cc_mqtt.*.log                 # MQTT logs (token distribution, etc.)
-  cc_bt.*.log                   # Bluetooth logs
-/data/common/resource/          # Resources (eye animations, etc.)
-```
-
-### 5. BLE Advertisement (Working)
-
-State changes can be passively detected. The current system uses this method.
-
-```
-xxxxxxxxxxxx | 4c | 01 | 2132 | 0010 | 39 | 00
-[  MAC  6B ] |seq | ?? | fixed | fixed |b12 |b13
-```
-
-| Byte | Content | Notes |
-|---|---|---|
-| 0-5 | BLE MAC address | Fixed |
-| 6 | Sequence number | Increments per request |
-| 7 | Unknown | Always 01 |
-| 8-9 | Unknown | Always 2132 |
-| 10-11 | Unknown | Always 0010 |
-| 12 | Action counter | Decrements on action execution |
-| 13 | Interaction flag | 00=idle, 03=voice responding |
-
-### 6. BLE GATT
-
-Has SwitchBot standard service `cba20d00-224d-11e6-9fb8-0002a5d5c51b`. Write characteristic (cba20002) and Notify characteristic (cba20003) available. No push notifications — request-response only.
-
-Only `0x57` prefix responds (`0x56`, `0x58`, `0x01`, etc. yield nothing). Full 0x5700-0x57FF brute-force completed with `ble_brute.py`.
-
-| Command | Response | Interpretation |
-|---|---|---|
-| 0x5700 | `01` | OK response only |
-| 0x5701 | `05` | Not supported |
-| 0x5702 | `01 64 19` | 01=OK, 64=battery 100%?, 19=state value |
-| 0x5703 | `05` | Not supported |
-| 0x5704 | `01 02` | Unknown (2-byte response) |
-| 0x5705-0x57FF | No response | — |
-
-## Current Detection Capabilities
-
-### What Can Be Detected
-
-- **Interaction start**: byte[13] changes 00→03 (voice command detected)
-- **Interaction end**: byte[13] changes 03→00
-- **Action execution**: byte[12] decrements (dance, photo, etc.)
-- **Photo list**: Via local API (auth solved)
-- **Face recognition data**: Registered/unregistered face list (via local API)
-- **Storage info**: Usage and capacity (via local API)
-- **Device internals**: Filesystem and log access via ADB
-
-### What Cannot Be Detected
-
-- **Voice recognition text**: Processed entirely on-device, not sent externally
-- **Command type**: Unknown what was instructed (only whether it reacted)
-
-## Architecture
-
-```
-┌──────────────┐  BLE Advertisement  ┌──────────────┐  HTTP POST  ┌──────────────┐
-│ Kata Friends │ ──────────────────→ │ ble_watcher  │ ──────────→ │  home_api    │
-│  (WoAIPE)    │  byte[12],[13]      │  (on Mac)    │  /events    │  (FastAPI)   │
-└──────────────┘                     └──────────────┘             └──────────────┘
-       ↑ ADB (port 5555)                    │
-       ↑ Local API (port 27999)             │
-       └────────────────────────────────────┘
-        Photos & face recognition (kata_local_api.py)
-```
-
-See **[Device Internals Documentation](docs/device_internals.md)** for full details.
-
-## Directory Structure
-
-```
-kata/
-├── .env                      # Secrets (tokens, MACs, etc.)
-├── .env.example              # .env template
-├── .gitignore
-├── README.md                 # Japanese documentation
-├── README_en.md              # This file
-├── requirements.txt          # Python dependencies
-├── ble_watcher.py            # BLE advertisement monitor → API event sender
-├── home_api/
-│   └── main.py               # FastAPI event receiver
-├── proxy/
-│   ├── kata_proxy.py         # mitmproxy transparent proxy (unused: no Wi-Fi traffic)
-│   └── capture_auth.py       # mitmweb auth analysis addon
-├── scripts/
-│   ├── 01_discover.sh        # Network device discovery
-│   ├── 02_capture.sh         # tcpdump packet capture
-│   ├── 03_analyze_pcap.sh    # pcap analysis
-│   ├── 04_setup_proxy.sh     # mitmproxy setup
-│   ├── 05_setup_routing.sh   # macOS routing setup
-│   ├── 06_teardown_routing.sh # Routing teardown
-│   ├── setup_webhook.py      # SwitchBot official API webhook management
-│   ├── kata_local_api.py     # Local API client (auth solved, working)
-│   ├── ble_monitor.py        # BLE advertisement monitor (debug)
-│   ├── ble_gatt_explore.py   # GATT service explorer
-│   ├── ble_command.py        # BLE command sender/tester
-│   └── ble_brute.py          # BLE GATT command brute-force scanner
-├── logs/                     # Event logs (auto-generated)
-└── captures/                 # pcap files (auto-generated)
-```
-
-## Getting Started
-
-### Terminal 1: API Server
-```bash
-pip3 install -r requirements.txt
-python3 -m uvicorn home_api.main:app --host 0.0.0.0 --port 9000
-```
-
-### Terminal 2: BLE Monitor
-```bash
-pip3 install bleak python-dotenv
-python3 ble_watcher.py
-```
-
-Talk to Kata Friends and events will be detected and sent to the API.
-
-### Local API Usage
-```bash
-python3 scripts/kata_local_api.py storage    # Storage info
-python3 scripts/kata_local_api.py photos     # Photo list
-python3 scripts/kata_local_api.py faces      # Face recognition data
-python3 scripts/kata_local_api.py discover   # Scan functionIDs
-python3 scripts/kata_local_api.py raw <ID>   # Arbitrary functionID
-```
-
-### ADB Access
-```bash
-adb connect <KATA_IP>:5555    # Root shell access
-adb shell                      # Explore device internals
-```
-
-## Dependencies
-
-```bash
-pip3 install -r requirements.txt
-pip3 install bleak python-dotenv
-```
-
-## Scripts
-
-### Main System
-
-#### ble_watcher.py
-
-Monitors BLE advertisements, detects Kata Friends state changes, and sends events to the API server.
-
-```bash
-python3 ble_watcher.py
-```
-
-Events sent:
-- `interaction_start` — Voice command detected (byte[13]: 00→03)
-- `interaction_end` — Response finished (byte[13]: 03→00)
-- `action` — Action executed (byte[12] decrements)
-
-#### home_api/main.py
-
-FastAPI server that receives events from the BLE monitor. Events are logged to `logs/kata_events.jsonl`.
-
-```bash
-python3 -m uvicorn home_api.main:app --host 0.0.0.0 --port 9000
-```
-
-Endpoints:
-- `POST /events` — Receive events
-- `GET /health` — Health check
-
-#### scripts/kata_local_api.py
-
-Local API client for Kata Friends. Retrieves photos, face recognition data, and storage info.
-
-Auth method: `auth = MD5(body + token)` (uses `KATA_LOCAL_TOKEN` from `.env`)
-
-```bash
-python3 scripts/kata_local_api.py storage    # Storage info
-python3 scripts/kata_local_api.py photos     # Photo list (with thumbnail URLs)
-python3 scripts/kata_local_api.py faces      # Face recognition data
-python3 scripts/kata_local_api.py discover   # Scan functionIDs
-python3 scripts/kata_local_api.py raw <ID>   # Arbitrary functionID
-```
-
-### Investigation & Debug Scripts
-
-#### scripts/ble_monitor.py
-
-Debug tool that displays raw BLE advertisement data. Highlights changed bytes between updates.
-
-```bash
-python3 scripts/ble_monitor.py
-```
-
-#### scripts/ble_gatt_explore.py
-
-Enumerates BLE GATT services and characteristics. Reads available values and subscribes to notifications.
-
-```bash
-python3 scripts/ble_gatt_explore.py
-```
-
-#### scripts/ble_command.py
-
-Sends commands to BLE GATT characteristics and checks responses. Tests SwitchBot standard commands (0x5701-0x5721) and various prefixes.
-
-```bash
-python3 scripts/ble_command.py
-```
-
-#### scripts/ble_brute.py
-
-Brute-force scanner for BLE GATT commands. Sweeps the second byte (0x00-0xFF) for a given prefix and logs all responses. Results are saved to `logs/`.
-
-```bash
-python3 scripts/ble_brute.py              # 0x5700-0x57FF (default)
-python3 scripts/ble_brute.py --prefix 01  # 0x0100-0x01FF
-```
-
-#### proxy/capture_auth.py
-
-mitmweb addon script for capturing traffic between iPhone SwitchBot app and Kata Friends, with auth header verification.
-
-```bash
-mitmweb -s proxy/capture_auth.py -p 8888 --set connection_strategy=lazy
-```
-
-#### scripts/setup_webhook.py
-
-SwitchBot official API (v1.1) webhook management. Requires `SWITCHBOT_TOKEN` and `SWITCHBOT_SECRET` in `.env`.
-
-```bash
-python3 scripts/setup_webhook.py setup <webhook_url>  # Register webhook
-python3 scripts/setup_webhook.py query                 # Check status
-python3 scripts/setup_webhook.py delete                # Delete webhook
-```
-
-### Network Investigation Scripts
-
-```bash
-# 1. Discover devices on network (ARP table)
-bash scripts/01_discover.sh
-
-# 2. Capture Kata Friends packets (sudo required)
-bash scripts/02_capture.sh <KATA_IP>
-
-# 3. Analyze pcap file (destination IPs, SNI, HTTP requests)
-bash scripts/03_analyze_pcap.sh <pcap_file>
-
-# 4. Install mitmproxy and setup CA certificate
-bash scripts/04_setup_proxy.sh
-
-# 5. macOS packet forwarding setup (redirect HTTPS to mitmproxy, sudo required)
-bash scripts/05_setup_routing.sh
-
-# 6. Tear down packet forwarding
-bash scripts/06_teardown_routing.sh
-```
-
-## Next Steps
-
-| Approach | Description | Difficulty |
-|---|---|---|
-| Mac microphone | Use BLE detection as trigger to record with Mac's mic → speech recognition via Whisper etc. | Low |
-| Local API functionID scan | Use `kata_local_api.py discover` to find unknown functionIDs | Low |
-| ADB deep investigation | Further explore application code and config files on device | Low |
-| LLM server integration | Send commands directly to the RKLLM server on port 8080 | Medium |
-| Firmware analysis | Detailed analysis of device binaries | High |
+| Photo list | `python3 scripts/kata_local_api.py photos` |
+| Face recognition | `python3 scripts/kata_local_api.py faces` |
+| Storage info | `python3 scripts/kata_local_api.py storage` |
+| Photo files | `adb pull /data/cache/image_recorder_archive/` |
+| Face photos | `adb pull /data/ai_brain_data/face_metadata/` |
+| Video files | `adb pull /data/cache/video_recorder_archive/` |
+| Logs | `adb shell "cat /data/cache/log/cc_main.*.log"` |
+| LLM models | `adb pull /data/ai_brain/actionmodel.rkllm` |
+| Action files | `adb pull /data/common/resource/pink/actions/` |
+| Eye animations | `adb pull /data/common/resource/pink/eyes/` |
+| SQLite DB | `adb pull /data/control_center/db/sqlite.db` |
+| System prompts | `adb shell "cat /app/opt/wlab/sweepbot/share/llm_server/res/*.txt"` |

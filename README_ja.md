@@ -1,401 +1,469 @@
 **[English](README.md)** | 日本語
 
-# Kata Friends 自宅API連携プロジェクト
+# Kata Friends デバイス内部構造
 
-SwitchBot Kata Friendsのイベントを検知し、自宅APIへ転送するシステム。
-ローカルAPIの認証を解明し、写真・顔認識データへのアクセスも実現済み。
+ADB経由でデバイス内部を調査した結果をまとめる。
 
-## デバイス情報
+## 接続方法
+
+```bash
+# adbのインストール（初回のみ）
+brew install android-platform-tools
+
+# 接続（認証不要・root権限）
+adb connect <KATA_IP>:5555
+
+# シェルを開く
+adb shell
+```
+
+Wi-Fiに繋がっていればいつでもアクセス可能。SwitchBotアプリ不要。
+
+## ハードウェア
 
 | 項目 | 値 |
 |---|---|
-| デバイス名 | KATAフレンズ |
-| BLE名 | WoAIPE (WonderLabs AI Pet) |
-| メーカー | Woan Technology (Shenzhen) |
-| BLE メーカーID | 2409 (SwitchBot/WonderLabs) |
-| SwitchBot API deviceId | .envに記載 |
-| Wi-Fi IP | .envに記載 |
-| Wi-Fi | 2.4GHz帯に接続 |
-| OS | Linux 6.1.99 aarch64 (Android系、ホスト名: WlabRobot) |
-| QRコード (背面) | あり（製造シリアル番号） |
+| CPU | ARM Cortex-A53 x4 (ARMv8-A) |
+| チップ | Rockchip RK3576 |
+| NPU | RKNN (Rockchip Neural Network) |
+| RAM | 7.7GB |
+| ストレージ | 28GB (/data) + SDカードスロット (/media/mmcblk1p1) |
+| OS | Linux 6.1.99 aarch64 (Debian系) |
+| ホスト名 | WlabRobot |
+| Python | 3.12.3 |
 
-## 調査結果
-
-### 1. Wi-Fi通信
-
-インターネットへの通信はほぼなし。音声認識・カメラの結果をクラウドに送信していない。
-
-### 2. SwitchBot公式API（v1.1）
-
-| エンドポイント | 結果 |
-|---|---|
-| `GET /v1.1/devices` | デバイスリストに「KATAフレンズ」として表示される。ただし`deviceType`フィールドが欠落（他デバイスにはある） |
-| `GET /v1.1/devices/{id}/status` | `statusCode: 100`（成功）だがbodyが空 `{}` |
-| Webhook登録 | 登録は可能だがKata Friendsからのイベントは送信されない |
-
-認証方式: HMAC-SHA256署名（`setup_webhook.py`に実装済み）
-
-### 3. ローカルAPI（認証解明済み）
-
-Kata FriendsはLAN上でHTTPサーバーを稼働。ポートはMQTT経由で動的に通知される。
-
-| 項目 | 値 |
-|---|---|
-| エンドポイント | `POST /thing_model/func_request` |
-| ヘルスチェック | `POST /heartbeat` |
-| ポート | 27999（MQTTで動的配布、以前は22090だった） |
-| 認証 | `auth: MD5(body + token)` |
-| トークン | MQTTで配布（.envに保存） |
-| 現状 | **動作中** |
-
-#### 認証方式
+## ファイルシステム概要
 
 ```
-auth = MD5(リクエストボディ + トークン)
+/
+├── app/          196MB  アプリケーション（tmpfsオーバーレイ）
+├── data/         8.5GB  ユーザーデータ・キャッシュ・AIモデル
+├── rom/          1.5GB  読み取り専用ファイルシステム
+├── usr/          1.3GB  システムバイナリ
+├── media/        517MB  SDカード
+├── opt/          195MB  追加パッケージ
+└── overlay/      229MB  オーバーレイFS
 ```
 
-- トークンはデバイスがMQTT経由でSwitchBotクラウドに通知するUUID形式の値
-- ADB経由でデバイスログから取得: `cc_mqtt.*.log` の `functionID:1021` メッセージ内
-- bodyが空（heartbeat）の場合: `auth = MD5(token)`
+## アプリケーション構造
 
-#### 解明の経緯
+### メインアプリ: `/app/opt/wlab/sweepbot/`
 
-1. mitmproxyでiPhoneアプリの通信をキャプチャし、authヘッダーがMD5形式（32文字hex）であることを確認
-2. heartbeatリクエスト（body空）で毎回同じauthになることから、タイムスタンプベースではないと判明
-3. ADB（ポート5555が開放）でデバイスにroot接続し、ログからトークンを発見
-4. `auth = MD5(body + token)` で全キャプチャ済みリクエストが一致
+```
+sweepbot/
+├── bin/              # 実行ファイル (69個)
+│   ├── master        # メインプロセス (395KB)
+│   ├── media         # メディア処理 (1.2MB)
+│   ├── pet_voice     # 音声処理 (985KB)
+│   ├── recorder      # 録画サービス (591KB)
+│   ├── rknn_server   # ニューラルネットワーク推論 (455KB)
+│   ├── uart_ota      # OTAアップデート
+│   │
+│   │   # Python/Flaskサーバー
+│   ├── flask_server_action.py  # LLMアクションサーバー (port 8080)
+│   ├── flask_server_diary.py   # LLM日記サーバー (port 8082)
+│   ├── route.py                # 統合ルーター (port 8083)
+│   │
+│   │   # シェルスクリプト (35個)
+│   ├── rknn_server.sh
+│   ├── llm_action_server.sh
+│   ├── llm_diary_server.sh
+│   ├── ai_brain.sh
+│   ├── slam.sh
+│   ├── media.sh
+│   ├── pet_voice.sh
+│   ├── petbot_eye.sh
+│   └── ...
+│
+├── config/           # デバイスモデル別設定
+│   ├── K20/          # MCUパラメータ
+│   ├── K20Pro/
+│   ├── S1/ S1+/ S10/ S20/ S20mini/ A01/
+│   └── *.lua         # SLAM設定
+│
+├── lib/              # 共有ライブラリ
+│   ├── libonnxruntime.so   # ML推論 (13MB)
+│   ├── libmosquitto.so     # MQTTクライアント
+│   ├── librkllmrt.so       # RKLLM推論ランタイム
+│   └── ai_brain/ bt_bridge/ control_center/ lds_slam/
+│
+└── share/            # リソース・モデル設定
+    ├── llm_server/res/
+    │   ├── action_system_prompt.txt     # アクション用システムプロンプト
+    │   ├── system_prompt_diary.txt      # 日記用システムプロンプト
+    │   └── system_prompt_diary_translation.txt  # 翻訳用プロンプト
+    ├── ai_brain/     # AI設定
+    ├── bt_bridge/    # Bluetooth設定
+    └── control_center/
+```
 
-#### 利用可能な機能
+## AIモデル
 
-| functionID | 機能 | 状態 |
+### LLM (大規模言語モデル)
+
+`/data/ai_brain/` に格納。
+
+| モデル | パス | サイズ | 用途 |
+|---|---|---|---|
+| Qwen3-1.7B | `Qwen3-1.7B_w8a8_RK3576_v3.rkllm` | 2.2GB | 日記生成 |
+| Action Model (Qwen3 LoRA SFT) | `qwen3_v7.0.2_lora_sft_nothink_*.rkllm` | 900MB | アクション判定 |
+| Action Model v1.1 | `actionmodel_w8a8_RK3576_v1.1.rkllm` | 900MB | 旧アクションモデル |
+
+シンボリックリンク:
+- `actionmodel.rkllm` → 最新のアクションモデル
+- `diarymodel.rkllm` → Qwen3-1.7B
+
+### 音声認識モデル
+
+`/data/ai_brain/voice/` に格納。
+
+| モデル | ファイル | 用途 |
 |---|---|---|
-| 9206 | ストレージ情報 | 動作確認済み |
-| 9217 | 写真タイムライン（顔認識付き） | 動作確認済み（176枚取得） |
-| 9225 | 顔認識データ（登録者・未登録者） | 動作確認済み（登録3人+未登録16人） |
+| VAD | `vad/silero_vad.onnx` | 音声区間検出 (Voice Activity Detection) |
+| KWS | `kws/encoder.onnx`, `decoder.onnx`, `joiner.onnx` | ウェイクワード検出 (Keyword Spotting) |
+| SenseVoice | `sensevoice/model.rknn` | 音声認識 (ASR) |
 
-リクエスト形式:
-```json
+ウェイクワード: `kws/keywords.txt` に定義
+
+### 顔認識
+
+バイナリベース。`/data/ai_brain_data/face_metadata/` に格納。
+
+## データストレージ
+
+### `/data/` ディレクトリ (8.5GB)
+
+```
+data/
+├── ai_brain/              # AIモデル (5GB+)
+│   ├── *.rkllm            # LLMモデル
+│   ├── voice/             # 音声モデル (VAD, KWS, SenseVoice)
+│   ├── llm_server/        # LLMサーバー設定
+│   └── model_version.json # モデルバージョン管理
+│
+├── ai_brain_data/         # AI実行時データ (19MB)
+│   └── face_metadata/
+│       ├── known/         # 登録済み顔 (ID_*/)
+│       │   └── ID_xxx/
+│       │       ├── enrolled_faces/   # 登録時の顔写真 (.jpg)
+│       │       ├── features/         # 顔特徴量ベクタ (.bin, 2KB each)
+│       │       └── recognized_faces/ # 認識された顔写真 (.jpg)
+│       └── unknown/       # 未登録の顔
+│           └── timestamp/
+│               ├── enrolled_faces/
+│               └── features/
+│
+├── control_center/        # メイン制御データ
+│   ├── db/sqlite.db       # SQLiteデータベース
+│   ├── maps/              # ナビゲーションマップ
+│   ├── snapshots/         # マップスナップショット
+│   ├── ai_images/         # AI生成画像
+│   │   ├── current/       # 最新
+│   │   └── history/       # 履歴
+│   └── task/              # タスク管理
+│       ├── current_task
+│       └── check_task
+│
+├── cache/                 # キャッシュ (835MB)
+│   ├── log/               # ログファイル (40+)
+│   │   ├── cc_main.*.log      # メインプロセス
+│   │   ├── cc_mqtt.*.log      # MQTT通信
+│   │   ├── cc_bt.*.log        # Bluetooth
+│   │   ├── rkllm_*.log        # LLM推論
+│   │   ├── wpa_supplicant.log # WiFi
+│   │   └── ...
+│   ├── image_recorder_archive/  # 撮影写真
+│   ├── video_recorder_archive/  # 録画動画
+│   └── vad/               # VADキャッシュ
+│
+├── common/                # 共有リソース (2.1GB)
+│   └── resource/
+│       ├── pink/          # デフォルトテーマ
+│       │   ├── actions/   # アクションファイル (169個, .act)
+│       │   └── eyes/      # 目のアニメーション (PNG, L/R)
+│       ├── blue/          # 青テーマ
+│       ├── black/         # 黒テーマ
+│       ├── base_eye/      # ベース目データ
+│       ├── limbs/         # 手足のデータ
+│       ├── wheels/        # 車輪データ
+│       └── sounds/        # サウンドエフェクト
+│
+├── map_server/            # SLAMナビゲーション
+│   ├── refined_maps/      # 整形済みマップ
+│   ├── labels/            # エリアラベル
+│   └── markers/           # マーカー
+│
+└── slam/                  # SLAMデバッグデータ
+```
+
+## 内部サービス
+
+### systemdサービス一覧 (28個)
+
+| サービス | 機能 |
+|---|---|
+| `master.service` | メインプロセス制御 |
+| `app.service` | アプリケーション |
+| `ai_brain.service` | AI頭脳 (認識・判断) |
+| `rknn_server.service` | ニューラルネットワーク推論 |
+| `llm_action.service` | LLMアクション判定 (port 8080) |
+| `llm_diary.service` | LLM日記生成 (port 8082) |
+| `llm_route.service` | LLMルーター (port 8083) |
+| `media.service` | メディア処理 |
+| `pet_voice.service` | 音声処理 |
+| `petbot_eye.service` | 目のアニメーション |
+| `recorder.service` | 録画 |
+| `slam.service` | SLAM (自己位置推定・地図生成) |
+| `bt_bridge.service` | Bluetooth |
+| `network_monitor.service` | ネットワーク監視 |
+| `bringup.service` | 起動シーケンス |
+| `system_helper.service` | システムヘルパー |
+| `update-robotic.service` | OTAアップデート |
+| `serial-control.service` | シリアル通信制御 |
+| `upload_image.service` | 画像アップロード |
+| `upload_video.service` | 動画アップロード |
+| `upload_audio.service` | 音声アップロード |
+| `upload-recorder.service` | 録画アップロード |
+| `debug_log_push.service` | デバッグログ送信 |
+| `debuglog_clean.service` | ログクリーンアップ |
+| `klog_record.service` | カーネルログ記録 |
+| `clean.service` | クリーンアップ |
+| `sd-auto-mount.service` | SDカード自動マウント |
+| `usb_event_proc.service` | USBイベント処理 |
+
+### 内部HTTPサーバー
+
+| ポート | サービス | 説明 |
+|---|---|---|
+| 8080 | flask_server_action.py | LLMアクション判定。音声テキストを受け取り `mood/instruction` を返す |
+| 8082 | flask_server_diary.py | LLM日記生成。イベントリストから日記を生成 |
+| 8083 | route.py | 統合ルーター。リクエスト内容に応じて8080/8082に振り分け |
+| 27999 | cc_main (C++) | ローカルAPI。写真・顔認識・ストレージ等 (auth必要) |
+| 5555 | adbd | ADBデーモン |
+
+## LLMアクションサーバー詳細
+
+### 概要
+
+音声認識テキストを受け取り、AIペットの反応（感情＋動作）を返す。
+
+### エンドポイント
+
+```
+POST http://<KATA_IP>:8080/rkllm_action
+Content-Type: application/json
+
+{"voiceText": "踊って"}
+```
+
+レスポンス: `happy/dance`
+
+### システムプロンプト
+
+AIペットとして、音声入力に対して`mood/instruction`形式で応答する。
+
+**利用可能なアクション**:
+`wave_hand`, `come_over`, `go_power`, `go_play`, `take_photo`, `be_silent`, `nod`, `shake_head`, `dance`, `look_left`, `look_right`, `look_up`, `look_down`, `go_away`, `move_forward`, `move_back`, `move_left`, `move_right`, `spin`, `turn_left`, `turn_right`, `go_to_kitchen`, `go_to_bedroom`, `go_to_balcony`, `good_morning`, `bye`, `good_night`, `follow_me`, `stop`, `go_sleep`, `volume_up`, `volume_down`, `sing`, `speak`, `welcome`, `user_leave`, `no_action`, `say_hello`, `show_love`, `wake_up`, `get_praise`
+
+**利用可能な感情**:
+`happy`, `angry`, `sad`, `scared`, `disgusted`, `surprised`, `neutral`
+
+### 判定ルール
+
+- ウェイクワード（hello, niko, noa, kata等）のみ → `neutral/no_action`
+- 背景ノイズ・口癖 → `neutral/no_action`
+- ウェイクワード + 明確な指令 → ウェイクワード無視して実行
+- 褒め言葉（見た目） → `happy/show_love`
+- 褒め言葉（行動） → `happy/get_praise`
+- 叱責 → `angry/no_action` or `sad/stop`
+
+## LLM日記サーバー詳細
+
+### 概要
+
+1日のインタラクションイベントから、AIペット視点の日記を生成する。
+
+### エンドポイント
+
+```
+POST http://<KATA_IP>:8082/rkllm_diary
+Content-Type: application/json
+
 {
-  "version": "1",
-  "code": 3,
-  "deviceID": "<KATA_DEVICE_ID>",
-  "payload": {
-    "functionID": 9206,
-    "requestID": "UUID",
-    "timestamp": 1709500000000,
-    "params": {}
-  }
+  "task": "diary",
+  "prompt": "language:Chinese\nlocal_date:2026-03-05\nevents:\n08:00 - 醒来啦\n19:15 - 被摸了耳朵"
 }
 ```
 
-### 4. デバイス内部（ADB経由）
+レスポンス: `タイトル/日記本文/感情`
 
-ADBデバッグがポート5555で常時有効。認証不要・root権限でシェルアクセス可能。
-SwitchBotアプリやプロキシは不要で、Kata FriendsがWi-Fiに接続されていればMacから直接アクセスできる。
+### 日記の特徴
 
-```bash
-# adbがなければインストール
-brew install android-platform-tools
+- **Pixar童話風**: 温かく、友好的で生き生きとした文体
+- **パートナー目線**: ユーザーを「主人」ではなく対等な仲間として扱う
+- **時間ぼかし**: 具体的な時刻は「朝」「夜」等に変換
+- **多言語対応**: 中国語で生成後、指定言語に翻訳（日本語、英語、韓国語等）
 
-# 接続（認証なし・root権限）
-adb connect <KATA_IP>:5555
-adb shell    # そのままrootシェルが開く
+### 利用可能な感情:
+`Happy`, `Excited`, `Relaxed`, `Curious`, `Loved`, `Sleepy`, `Sad`, `Scared`, `Angry`, `Lonely`
+
+## 顔認識データ
+
+### ディレクトリ構造
+
+```
+/data/ai_brain_data/face_metadata/
+├── known/                     # 登録済み
+│   └── ID_<timestamp>/       # 顔ごとのディレクトリ
+│       ├── enrolled_faces/   # 登録時の写真 (.jpg)
+│       ├── features/         # 顔特徴量ベクタ (.bin, 各2056B)
+│       └── recognized_faces/ # 認識された写真 (.jpg, 大量)
+└── unknown/                   # 未登録
+    └── <timestamp>/
+        ├── enrolled_faces/
+        └── features/
 ```
 
-| 項目 | 値 |
+### アクセス方法
+
+```bash
+# 登録済み顔の一覧
+adb shell "ls /data/ai_brain_data/face_metadata/known/"
+
+# 特定の顔の登録写真をMacに取得
+adb pull /data/ai_brain_data/face_metadata/known/ID_xxx/enrolled_faces/
+
+# 認識された写真を取得
+adb pull /data/ai_brain_data/face_metadata/known/ID_xxx/recognized_faces/
+
+# ローカルAPI経由でも取得可能
+python3 scripts/kata_local_api.py faces
+```
+
+## 写真・動画
+
+### 写真
+
+ローカルAPI経由でサムネイル付きリストを取得:
+
+```bash
+python3 scripts/kata_local_api.py photos
+```
+
+ADB経由で直接アクセス:
+
+```bash
+# 撮影写真（キャッシュ）
+adb shell "ls /data/cache/image_recorder_archive/"
+
+# Macにダウンロード
+adb pull /data/cache/image_recorder_archive/ ./kata_photos/
+```
+
+### 動画
+
+```bash
+adb shell "ls /data/cache/video_recorder_archive/"
+adb pull /data/cache/video_recorder_archive/ ./kata_videos/
+```
+
+## ログ
+
+### ログファイル一覧
+
+`/data/cache/log/` に40以上のログファイル。
+
+| ログ | 内容 |
 |---|---|
-| OS | Linux 6.1.99 aarch64 (Debian系) |
-| ホスト名 | WlabRobot |
-| ユーザー | root |
-| Python | 3.12.3 |
-| Webフレームワーク | Flask (Werkzeug) |
-| LLMランタイム | RKLLM (Rockchip NPU) |
-| チップ | RK3588系 |
+| `cc_main.*.log` | メインプロセス（認証検証、イベント処理等） |
+| `cc_mqtt.*.log` | MQTT通信（トークン配布、プロパティ変更等） |
+| `cc_bt.*.log` | Bluetooth通信（BLEアドバタイズデータ等） |
+| `rkllm_action_server.log` | LLMアクション推論ログ |
+| `rkllm_server.log` | LLMルーターログ |
+| `wpa_supplicant.log` | WiFi接続ログ |
+| `task_executor_runner.log` | タスク実行ログ |
 
-開放ポート:
+### リアルタイムログ監視
 
-| ポート | 用途 |
+```bash
+# メインプロセスの最新ログを表示
+adb shell "tail -f /data/cache/log/cc_main.*.log"
+
+# MQTT通信を監視
+adb shell "tail -f /data/cache/log/cc_mqtt.*.log"
+
+# LLM推論を監視
+adb shell "tail -f /data/cache/log/rkllm_action_server.log"
+```
+
+## リソースファイル
+
+### テーマ
+
+`/data/common/resource/` に3つのカラーテーマ:
+
+| テーマ | パス |
 |---|---|
-| 5555 | ADB (Android Debug Bridge) |
-| 8080 | LLMアクションサーバー (Flask/RKLLM) |
-| 8082 | 不明 |
-| 27999 | ローカルAPI (thing_model) |
-| 50001 | 不明 |
+| ピンク | `/data/common/resource/pink/` |
+| ブルー | `/data/common/resource/blue/` |
+| ブラック | `/data/common/resource/black/` |
 
-主要ディレクトリ:
-```
-/app/opt/wlab/sweepbot/bin/     # メインアプリケーション
-  flask_server_action.py        # LLMアクションサーバー (port 8080)
-  flask_server_diary.py         # 日記サーバー
-  route.py                      # ルーティング
-/data/cache/log/                # ログ
-  cc_main.*.log                 # メインプロセスログ（auth検証等）
-  cc_mqtt.*.log                 # MQTT通信ログ（トークン配布等）
-  cc_bt.*.log                   # Bluetoothログ
-/data/common/resource/          # リソース（目のアニメーション等）
-```
+各テーマに含まれるもの:
+- `actions/` — アクションファイル (169個, `.act`形式)
+- `eyes/` — 目のアニメーションフレーム (PNG, 左右別)
 
-### 5. BLEアドバタイズ（動作中）
+### アクション
 
-状態変化をパッシブに検知可能。現在のシステムはこの方式で動作。
+169個の`.act`ファイル。命名規則:
 
-```
-xxxxxxxxxxxx | 4c | 01 | 2132 | 0010 | 39 | 00
-[  MAC  6B ] |seq | ?? | 固定  | 固定  |b12 |b13
-```
-
-| バイト | 内容 | 備考 |
+| プレフィクス | 意味 | 例 |
 |---|---|---|
-| 0-5 | BLE MACアドレス | 固定 |
-| 6 | シーケンス番号 | リクエストごとにインクリメント |
-| 7 | 不明 | 常に01 |
-| 8-9 | 不明 | 常に2132 |
-| 10-11 | 不明 | 常に0010 |
-| 12 | アクションカウンタ | アクション実行ごとにデクリメント |
-| 13 | インタラクションフラグ | 00=待機中, 03=音声応答中 |
+| `RDANCE` | ダンス | `RDANCE008.act` |
+| `RKATA` | Kata固有 | `RKATA1.act` ~ `RKATA6.act` |
+| `RSING` | 歌 | `RSING001.act` |
+| `RSLEEP` | 睡眠 | `RSLEEP000.act` |
+| `RMAP` | マップ移動 | `RMAPGO.act`, `RMAPBACK.act` |
+| `RPIC` | 写真撮影 | `RPIC001.act` |
+| `RGO` | 移動 | `RGO000.act`, `RGO001.act` |
+| `RW*` | 歩行 | `RWF001.act`, `RWL.act`, `RWR.act` |
 
-### 6. BLE GATT
+### 目のアニメーション
 
-SwitchBot標準サービス `cba20d00-224d-11e6-9fb8-0002a5d5c51b` を持つ。Writeキャラ（cba20002）とNotifyキャラ（cba20003）あり。通知のプッシュはなくリクエスト-レスポンス型。
+目の表情はPNGフレームで構成（左目_L、右目_R）:
 
-`0x57`プレフィクスのみ応答あり（`0x56`, `0x58`, `0x01`等は全滅）。`ble_brute.py`で0x5700〜0x57FFを総当たり済み。
+| アニメーション | 説明 |
+|---|---|
+| `OPEN_L/R` | 目を開く |
+| `CLOSE_L/R` | 目を閉じる |
+| `ESleep01_L/R` | 睡眠 |
+| `ENAWAKE*_L/R` | 目覚め |
+| `ESL0-SL4_L/R` | 瞼の動き |
 
-| コマンド | 応答 | 解釈 |
-|---|---|---|
-| 0x5700 | `01` | OK応答のみ |
-| 0x5701 | `05` | 非対応 |
-| 0x5702 | `01 64 19` | 01=OK, 64=バッテリー100%?, 19=状態値 |
-| 0x5703 | `05` | 非対応 |
-| 0x5704 | `01 02` | 不明（2バイト応答） |
-| その他 0x5705〜0x57FF | 応答なし | — |
+## SQLiteデータベース
 
-## 現在の検知能力
+`/data/control_center/db/sqlite.db`
 
-### 検知できること
-
-- **インタラクション開始**: byte[13]が00→03に変化（呼びかけ検知）
-- **インタラクション終了**: byte[13]が03→00に変化
-- **アクション実行**: byte[12]がデクリメント（ダンス・写真撮影等）
-- **写真一覧**: ローカルAPI経由（認証解明済み）
-- **顔認識データ**: 登録者・未登録者の一覧（ローカルAPI経由）
-- **ストレージ情報**: 使用量・総容量（ローカルAPI経由）
-- **デバイス内部**: ADB経由でファイルシステム・ログにアクセス可能
-
-### 検知できないこと
-
-- **音声認識テキスト**: デバイス内で完結、外部に送信されない
-- **認識コマンドの種類**: 何を指示したかは不明（反応したかどうかのみ）
-
-## アーキテクチャ
-
-```
-┌──────────────┐  BLE Advertisement  ┌──────────────┐  HTTP POST  ┌──────────────┐
-│ Kata Friends │ ──────────────────→ │ ble_watcher  │ ──────────→ │  home_api    │
-│  (WoAIPE)    │  byte[12],[13]変化   │  (Mac上)     │  /events    │  (FastAPI)   │
-└──────────────┘                     └──────────────┘             └──────────────┘
-       ↑ ADB (port 5555)                    │
-       ↑ Local API (port 27999)             │
-       └────────────────────────────────────┘
-        写真・顔認識データ取得 (kata_local_api.py)
-```
-
-詳細は **[デバイス内部構造ドキュメント](docs/device_internals_ja.md)** を参照。
-
-## ディレクトリ構成
-
-```
-kata/
-├── .env                      # 秘密情報（トークン、MAC等）
-├── .env.example              # .envのテンプレート
-├── .gitignore
-├── README.md                 # このファイル
-├── README_en.md              # English version
-├── requirements.txt          # Python依存関係
-├── ble_watcher.py            # BLEアドバタイズ監視 → APIイベント送信
-├── home_api/
-│   └── main.py               # FastAPIイベント受信サーバー
-├── proxy/
-│   ├── kata_proxy.py         # mitmproxy透過プロキシ（未使用: Wi-Fi通信なし）
-│   └── capture_auth.py       # mitmweb auth解析用スクリプト
-├── scripts/
-│   ├── 01_discover.sh        # ネットワークデバイス探索
-│   ├── 02_capture.sh         # tcpdumpパケットキャプチャ
-│   ├── 03_analyze_pcap.sh    # pcap解析
-│   ├── 04_setup_proxy.sh     # mitmproxyセットアップ
-│   ├── 05_setup_routing.sh   # macOSルーティング設定
-│   ├── 06_teardown_routing.sh # ルーティング解除
-│   ├── setup_webhook.py      # SwitchBot公式API Webhook登録・管理
-│   ├── kata_local_api.py     # ローカルAPIクライアント（認証済み・動作中）
-│   ├── ble_monitor.py        # BLEアドバタイズ監視（デバッグ用）
-│   ├── ble_gatt_explore.py   # GATT サービス探索
-│   ├── ble_command.py        # BLEコマンド送信テスト
-│   └── ble_brute.py          # BLE GATTコマンド総当たり探索
-├── logs/                     # イベントログ（自動生成）
-└── captures/                 # pcapファイル（自動生成）
-```
-
-## 起動方法
-
-### ターミナル1: APIサーバー
-```bash
-cd ~/Documents/kata
-python3 -m uvicorn home_api.main:app --host 0.0.0.0 --port 9000
-```
-
-### ターミナル2: BLE監視
-```bash
-cd ~/Documents/kata
-python3 ble_watcher.py
-```
-
-Kata Friendsに話しかけるとイベントが検知され、APIに送信される。
-
-### ローカルAPI利用
-```bash
-python3 scripts/kata_local_api.py storage    # ストレージ情報
-python3 scripts/kata_local_api.py photos     # 写真一覧
-python3 scripts/kata_local_api.py faces      # 顔認識データ
-python3 scripts/kata_local_api.py discover   # functionID探索
-python3 scripts/kata_local_api.py raw <ID>   # 任意のfunctionID
-```
-
-### ADB接続
-```bash
-adb connect <KATA_IP>:5555    # root権限でシェルアクセス
-adb shell                      # デバイス内部を探索
-```
-
-## 依存関係
+デバイスにsqlite3コマンドがないため、Macにダウンロードして確認:
 
 ```bash
-pip3 install -r requirements.txt
-pip3 install bleak python-dotenv
+adb pull /data/control_center/db/sqlite.db ./
+sqlite3 sqlite.db ".tables"
+sqlite3 sqlite.db ".schema"
 ```
 
-## スクリプト
+## ファイルの取得方法まとめ
 
-### メインシステム
-
-#### ble_watcher.py
-
-BLEアドバタイズを監視し、Kata Friendsの状態変化を検知してAPIサーバーにイベントを送信する。
-
-```bash
-python3 ble_watcher.py
-```
-
-送信されるイベント:
-- `interaction_start` — 呼びかけ検知（byte[13]: 00→03）
-- `interaction_end` — 応答終了（byte[13]: 03→00）
-- `action` — アクション実行（byte[12]がデクリメント）
-
-#### home_api/main.py
-
-BLE監視からのイベントを受信するFastAPIサーバー。イベントは `logs/kata_events.jsonl` に記録される。
-
-```bash
-python3 -m uvicorn home_api.main:app --host 0.0.0.0 --port 9000
-```
-
-エンドポイント:
-- `POST /events` — イベント受信
-- `GET /health` — ヘルスチェック
-
-#### scripts/kata_local_api.py
-
-Kata FriendsのローカルAPIクライアント。写真・顔認識データ・ストレージ情報を取得できる。
-
-認証方式: `auth = MD5(body + token)`（`.env`の`KATA_LOCAL_TOKEN`を使用）
-
-```bash
-python3 scripts/kata_local_api.py storage    # ストレージ情報
-python3 scripts/kata_local_api.py photos     # 写真一覧（サムネイルURL付き）
-python3 scripts/kata_local_api.py faces      # 顔認識データ
-python3 scripts/kata_local_api.py discover   # functionID探索
-python3 scripts/kata_local_api.py raw <ID>   # 任意のfunctionID
-```
-
-### 調査・デバッグ用スクリプト
-
-#### scripts/ble_monitor.py
-
-BLEアドバタイズの生データを表示するデバッグツール。変化したバイトをハイライト表示する。
-
-```bash
-python3 scripts/ble_monitor.py
-```
-
-#### scripts/ble_gatt_explore.py
-
-BLE GATTサービスとキャラクタリスティックを列挙する。読み取り可能な値の取得と通知のサブスクライブも行う。
-
-```bash
-python3 scripts/ble_gatt_explore.py
-```
-
-#### scripts/ble_command.py
-
-BLE GATTキャラクタリスティックにコマンドを送信して応答を確認する。SwitchBot標準コマンド（0x5701〜0x5721）と各種プレフィクスを試行する。
-
-```bash
-python3 scripts/ble_command.py
-```
-
-#### scripts/ble_brute.py
-
-BLE GATTコマンドの総当たり探索。指定プレフィクスの2バイト目を0x00〜0xFFで全探索し、応答のあるコマンドを発見する。結果は `logs/` に保存される。
-
-```bash
-python3 scripts/ble_brute.py              # 0x5700〜0x57FF（デフォルト）
-python3 scripts/ble_brute.py --prefix 01  # 0x0100〜0x01FF
-```
-
-#### proxy/capture_auth.py
-
-mitmweb用のアドオンスクリプト。iPhone SwitchBotアプリとKata Friends間の通信をキャプチャし、authヘッダーの検証を行う。
-
-```bash
-mitmweb -s proxy/capture_auth.py -p 8888 --set connection_strategy=lazy
-```
-
-#### scripts/setup_webhook.py
-
-SwitchBot公式API（v1.1）のWebhook管理。`.env`の`SWITCHBOT_TOKEN`と`SWITCHBOT_SECRET`が必要。
-
-```bash
-python3 scripts/setup_webhook.py setup <webhook_url>  # Webhook登録
-python3 scripts/setup_webhook.py query                 # 登録状況確認
-python3 scripts/setup_webhook.py delete                # Webhook削除
-```
-
-### ネットワーク調査スクリプト
-
-```bash
-# 1. ネットワーク上のデバイス探索（ARPテーブル表示）
-bash scripts/01_discover.sh
-
-# 2. Kata Friendsのパケットキャプチャ（sudo必要）
-bash scripts/02_capture.sh <KATA_IP>
-
-# 3. pcapファイルの解析（宛先IP、SNI、HTTPリクエスト抽出）
-bash scripts/03_analyze_pcap.sh <pcapファイル>
-
-# 4. mitmproxyのインストールとCA証明書セットアップ
-bash scripts/04_setup_proxy.sh
-
-# 5. macOSパケットフォワーディング設定（HTTPS通信をmitmproxyへ転送、sudo必要）
-bash scripts/05_setup_routing.sh
-
-# 6. パケットフォワーディング解除
-bash scripts/06_teardown_routing.sh
-```
-
-## 次のステップ
-
-| アプローチ | 概要 | 難易度 |
-|---|---|---|
-| Macマイク併用 | BLE検知をトリガーにMacのマイクで録音→Whisper等で音声認識 | 低 |
-| ローカルAPI functionID探索 | `kata_local_api.py discover` で未知のfunctionIDを発見する | 低 |
-| ADB内部調査 | デバイス内のアプリケーションコード・設定ファイルをさらに調査 | 低 |
-| LLMサーバー連携 | ポート8080のRKLLMサーバーに直接コマンドを送信 | 中 |
-| ファームウェア解析 | デバイス内部のバイナリを詳細に解析 | 高 |
+| データ | 方法 |
+|---|---|
+| 写真一覧 | `python3 scripts/kata_local_api.py photos` |
+| 顔認識データ | `python3 scripts/kata_local_api.py faces` |
+| ストレージ情報 | `python3 scripts/kata_local_api.py storage` |
+| 写真ファイル | `adb pull /data/cache/image_recorder_archive/` |
+| 顔写真 | `adb pull /data/ai_brain_data/face_metadata/` |
+| 動画ファイル | `adb pull /data/cache/video_recorder_archive/` |
+| ログ | `adb shell "cat /data/cache/log/cc_main.*.log"` |
+| LLMモデル | `adb pull /data/ai_brain/actionmodel.rkllm` |
+| アクションファイル | `adb pull /data/common/resource/pink/actions/` |
+| 目のアニメーション | `adb pull /data/common/resource/pink/eyes/` |
+| SQLiteデータベース | `adb pull /data/control_center/db/sqlite.db` |
+| システムプロンプト | `adb shell "cat /app/opt/wlab/sweepbot/share/llm_server/res/*.txt"` |
