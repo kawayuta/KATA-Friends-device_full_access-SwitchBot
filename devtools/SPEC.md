@@ -159,6 +159,59 @@ systemctl restart kata-devtools   # 再起動
 journalctl -u kata-devtools -f    # ログ確認
 ```
 
+### デプロイ手順
+
+#### 初回セットアップ
+
+```bash
+# 1. ADB 接続
+adb connect <KATA_IP>:5555
+
+# 2. デプロイ実行
+bash scripts/deploy_devtools.sh [KATA_IP]
+
+# 3. 初回は overlayfs 反映のため reboot が必要
+adb -s <KATA_IP>:5555 reboot
+
+# 4. 再起動後、自動起動を確認 (30-60秒待つ)
+adb connect <KATA_IP>:5555
+adb -s <KATA_IP>:5555 shell systemctl status kata-devtools
+
+# 5. ブラウザでアクセス
+open http://<KATA_IP>:9001
+```
+
+#### アプリ更新時 (2回目以降)
+
+overlayfs の設定は済んでいるので reboot 不要。
+
+```bash
+# 1. ファイルを push
+bash scripts/deploy_devtools.sh [KATA_IP]
+
+# 2. サービス再起動
+adb -s <KATA_IP>:5555 shell systemctl restart kata-devtools
+```
+
+#### トラブルシューティング
+
+```bash
+# ログ確認
+adb -s <KATA_IP>:5555 shell journalctl -u kata-devtools -f
+
+# サービス状態
+adb -s <KATA_IP>:5555 shell systemctl status kata-devtools
+
+# overlay フラグ確認 (なければ overlay_upper が毎回消える)
+adb -s <KATA_IP>:5555 shell ls -la /overlay/overlay_upper
+
+# サービスファイル確認
+adb -s <KATA_IP>:5555 shell ls -la /etc/systemd/system/kata-devtools.service
+
+# 手動起動テスト
+adb -s <KATA_IP>:5555 shell "cd /data/devtools && python3 app_flask.py"
+```
+
 ### デプロイスクリプト (`scripts/deploy_devtools.sh`)
 
 ```bash
@@ -168,11 +221,11 @@ bash scripts/deploy_devtools.sh [KATA_IP]
 
 **処理内容:**
 1. ADB 接続確認
-2. `/data/devtools/` ディレクトリ作成 + ファイル push
+2. `/data/devtools/` ディレクトリ作成 + アプリファイル push + `start.sh` 作成
 3. `/overlay/overlay_upper` フラグファイル作成 (overlay 永続化)
 4. systemd サービスファイルを `/data/overlay_upper/etc/systemd/system/` に配置
 5. `multi-user.target.wants` にシンボリックリンクで自動起動有効化
-6. `systemctl enable --now` で即時起動 (初回は要 reboot)
+6. `systemctl enable --now` で即時起動を試行 (初回は要 reboot)
 
 ### overlayfs 永続化の仕組み
 
@@ -606,12 +659,6 @@ BLE イベントログの表示。
 ---
 
 ## セキュリティ
-
-### 認証情報の管理
-
-- 実際のトークン・シークレットは `.env` に格納 (`.gitignore` 済み、リポジトリに含まれない)
-- `.env.example` にはプレースホルダーのみ記載
-- ローカルAPI認証方式 (`MD5(body + token)`) はコード内に公開しているが、トークン自体はデバイスごとにMQTT経由で動的に発行されるUUIDのため、アルゴリズム公開による影響なし
 
 ### アクセス範囲
 
