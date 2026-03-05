@@ -343,9 +343,12 @@ def execute_action():
 
 @app.post("/api/custom-llm")
 def custom_llm_call():
-    """Call diary LLM (Qwen3-1.7B :8082) with custom prompt template."""
+    """Call diary LLM with custom prompt template. Supports VLM with image."""
+    import base64 as b64mod
     data = request.get_json(force=True)
     text = data.get("text", "").strip()
+    use_camera = data.get("use_camera", False)
+
     if not text:
         return flask_error(400, "text is required")
 
@@ -375,7 +378,61 @@ def custom_llm_call():
         except Exception:
             pass
 
-    # Call diary server with retries
+    # VLM mode: capture camera image and call VLM endpoint
+    if use_camera:
+        try:
+            # Capture camera snapshot
+            video_dev = "/dev/video12"
+            width, height = 448, 448
+            v4l2 = subprocess.Popen(
+                ["v4l2-ctl", "-d", video_dev,
+                 "--set-fmt-video", f"width={width},height={height},pixelformat=NV12",
+                 "--stream-mmap", "--stream-count=1", "--stream-to=-"],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            ffmpeg = subprocess.Popen(
+                ["ffmpeg", "-loglevel", "error",
+                 "-f", "rawvideo", "-pix_fmt", "nv12",
+                 "-video_size", f"{width}x{height}",
+                 "-i", "-", "-frames:v", "1",
+                 "-f", "image2pipe", "-vcodec", "mjpeg", "-q:v", "2", "-"],
+                stdin=v4l2.stdout, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            v4l2.stdout.close()
+            jpeg_data, _ = ffmpeg.communicate(timeout=10)
+            v4l2.wait(timeout=5)
+            if not jpeg_data:
+                return flask_error(500, "camera capture failed")
+            image_b64 = b64mod.b64encode(jpeg_data).decode()
+        except Exception as e:
+            return flask_error(500, f"camera capture error: {e}")
+
+        # Call VLM endpoint
+        try:
+            resp = requests.post(
+                "http://127.0.0.1:8082/rkllm_vlm",
+                json={
+                    "prompt": filled,
+                    "image_base64": image_b64,
+                    "max_new_tokens": int(config.get("max_new_tokens", 512)),
+                },
+                timeout=300,
+            )
+            if resp.status_code == 503:
+                return flask_error(503, "VLM server busy")
+            result_text = resp.text.strip()
+            result_text = re.sub(
+                r"<think>.*?</think>", "", result_text, flags=re.DOTALL
+            ).strip()
+            return jsonify({
+                "result": result_text,
+                "prompt": filled,
+                "mode": "vlm",
+            })
+        except requests.ConnectionError:
+            return flask_error(502, "VLM server (8082) unreachable")
+        except requests.Timeout:
+            return flask_error(504, "VLM timeout")
+
+    # Text-only mode: call diary server
     payload = {
         "task": config.get("task", "custom"),
         "prompt": filled,

@@ -240,10 +240,13 @@
         <label class="block text-sm text-gray-400 mb-1">テキスト入力</label>
         <textarea id="custom-input" rows="4" placeholder="テキストを入力... (テンプレートの {text} に代入されます)" class="w-full bg-gray-800 border border-gray-600 rounded px-3 py-2 focus:outline-none focus:border-kata-500"></textarea>
       </div>
-      <div class="flex gap-2 mb-4">
+      <div class="flex items-center gap-3 mb-4">
         <button onclick="callCustomLLM()" id="custom-send" class="bg-kata-500 hover:bg-kata-600 text-black font-medium px-4 py-2 rounded transition">実行</button>
+        <label class="text-sm text-gray-400 flex items-center gap-1">
+          <input type="checkbox" id="custom-use-camera" class="accent-indigo-500"> カメラ (VLM)
+        </label>
       </div>
-      <p class="text-xs text-gray-500 mb-3">Prompt タブの「Custom LLM プロンプト」にテンプレートを設定。入力テキストが <code class="text-gray-400">{text}</code> に代入されます。「起動設定」で temperature / max_new_tokens を調整可能。日記LLM (Qwen3-1.7B :8082) を使用。</p>
+      <p class="text-xs text-gray-500 mb-3">Prompt タブの「Custom LLM プロンプト」にテンプレートを設定。入力テキストが <code class="text-gray-400">{text}</code> に代入されます。カメラONでカメラ映像+テキストをVLM (Qwen3-VL-2B) に送信。</p>
       <div id="custom-result" class="bg-gray-800 rounded p-4 min-h-[100px] hidden">
         <pre class="text-sm whitespace-pre-wrap"></pre>
       </div>
@@ -475,19 +478,21 @@ async function executeAction(preset) {
 async function callCustomLLM() {
   const text = document.getElementById('custom-input').value.trim();
   if (!text) return;
+  const useCamera = document.getElementById('custom-use-camera').checked;
   setLoading('custom-send', true);
   const resultEl = document.getElementById('custom-result');
   resultEl.classList.remove('hidden');
-  resultEl.querySelector('pre').textContent = '推論中... (最大2分)';
+  resultEl.querySelector('pre').textContent = useCamera ? 'カメラ撮影+VLM推論中... (最大3分)' : '推論中... (最大2分)';
   try {
     const data = await apiCall('/api/custom-llm', {
       method: 'POST',
-      body: JSON.stringify({ text }),
+      body: JSON.stringify({ text, use_camera: useCamera }),
     });
     if (data.error) {
       resultEl.querySelector('pre').textContent = 'エラー: ' + data.error;
     } else {
-      resultEl.querySelector('pre').textContent = data.result || '(empty response)';
+      const modeLabel = data.mode === 'vlm' ? '[VLM] ' : '';
+      resultEl.querySelector('pre').textContent = modeLabel + (data.result || '(empty response)');
     }
     const preview = document.getElementById('custom-prompt-preview');
     if (data.prompt) {
