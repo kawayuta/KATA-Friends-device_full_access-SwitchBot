@@ -52,12 +52,21 @@ chmod +x ${DEVICE_DIR}/start.sh"
 echo "  OK"
 
 # Enable overlay persistence flag
-echo "[4/6] Enabling overlay persistence..."
+echo "[4/7] Enabling overlay persistence..."
 adb -s "${ADB_TARGET}" shell "touch /overlay/overlay_upper"
 echo "  OK"
 
+# Fix permissions on editable files (prompt files + launch scripts)
+echo "[5/7] Setting file permissions..."
+adb -s "${ADB_TARGET}" shell "chmod a+w \
+  /app/opt/wlab/sweepbot/share/llm_server/res/*.txt \
+  /app/opt/wlab/sweepbot/bin/llm_action_server.sh \
+  /app/opt/wlab/sweepbot/bin/llm_diary_server.sh \
+  2>/dev/null; true"
+echo "  OK"
+
 # Set up systemd service in overlay upper
-echo "[5/6] Setting up systemd service..."
+echo "[6/7] Setting up systemd service..."
 adb -s "${ADB_TARGET}" shell "
 mkdir -p ${SYSTEMD_DIR}/multi-user.target.wants
 
@@ -70,6 +79,7 @@ After=network.target master.service
 Type=simple
 User=wlab
 WorkingDirectory=/data/devtools
+ExecStartPre=+/bin/bash -c 'chmod a+w /app/opt/wlab/sweepbot/share/llm_server/res/*.txt /app/opt/wlab/sweepbot/bin/llm_action_server.sh /app/opt/wlab/sweepbot/bin/llm_diary_server.sh 2>/dev/null; true'
 ExecStart=/data/devtools/start.sh
 Restart=always
 RestartSec=3
@@ -85,7 +95,7 @@ ln -sf /etc/systemd/system/${SERVICE_NAME}.service \
 echo "  OK"
 
 # Try to start immediately, or advise reboot
-echo "[6/6] Starting service..."
+echo "[7/7] Starting service..."
 if adb -s "${ADB_TARGET}" shell "systemctl daemon-reload && systemctl enable --now ${SERVICE_NAME}" 2>/dev/null; then
   sleep 2
   adb -s "${ADB_TARGET}" shell "systemctl status ${SERVICE_NAME} --no-pager -l" || true

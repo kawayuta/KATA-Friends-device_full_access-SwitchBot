@@ -169,31 +169,76 @@ def proxy_action():
         return flask_error(502, str(e))
 
 
+DIARY_RECORD_PATH = "/data/control_center/db/diary_record.json"
+GENERATED_DIARIES_PATH = "/data/devtools/generated_diaries.json"
+
+
+def _load_generated_diaries():
+    if not os.path.isfile(GENERATED_DIARIES_PATH):
+        return {}
+    try:
+        with open(GENERATED_DIARIES_PATH, "r", encoding="utf-8") as f:
+            return json.loads(f.read())
+    except Exception:
+        return {}
+
+
+def _save_generated_diary(date, diary_data):
+    diaries = _load_generated_diaries()
+    diaries[date] = {**diary_data, "generated_at": time.strftime("%Y-%m-%d %H:%M:%S")}
+    with open(GENERATED_DIARIES_PATH, "w", encoding="utf-8") as f:
+        f.write(json.dumps(diaries, ensure_ascii=False, indent=2))
+
+
+@app.get("/api/diary/records")
+def get_diary_records():
+    """Return event records and generated diaries from device."""
+    events = {}
+    if os.path.isfile(DIARY_RECORD_PATH):
+        try:
+            with open(DIARY_RECORD_PATH, "r", encoding="utf-8") as f:
+                data = json.loads(f.read())
+            events = data.get("diary_event_records", {})
+        except Exception:
+            pass
+    return jsonify({
+        "events": events,
+        "generated": _load_generated_diaries(),
+    })
+
+
 @app.post("/api/diary")
 def proxy_diary():
-    """LLM diary server (:8082) proxy."""
+    """Proxy to route server (:8083) — same pipeline as production."""
     data = request.get_json(force=True)
     events = data.get("events", [])
     language = data.get("language", "ja")
     local_date = data.get("local_date", "") or time.strftime("%Y-%m-%d")
 
-    lang_map = {"ja": "Japanese", "en": "English", "zh": "Chinese"}
-    lang_name = lang_map.get(language, language)
-    events_str = "\n".join(events)
-    prompt = f"language:{lang_name}\nlocal_date:{local_date}\nevents:\n{events_str}"
-
+    # Send to route server in the exact format it expects
+    # Route server handles: dedup, retry (x3), format validation, translation
+    payload = {
+        "language": language,
+        "local_date": local_date,
+        "events": events,
+    }
     try:
         resp = requests.post(
-            "http://127.0.0.1:8082/rkllm_diary",
-            json={"task": "diary", "prompt": prompt},
-            timeout=30,
+            "http://127.0.0.1:8083/rkllm_diary",
+            json=payload,
+            timeout=600,
         )
-        try:
-            return jsonify(resp.json())
-        except Exception:
-            return jsonify({"raw": resp.text.strip()})
+        body = resp.json()
+        # Route server returns {"resultCode":100,"data":{"title":..,"diary":..,"emotion":..}}
+        if body.get("resultCode") == 100 and body.get("data"):
+            result = body["data"]
+            _save_generated_diary(local_date, result)
+            return jsonify(result)
+        return jsonify({"error": body.get("message", "unknown error"), "raw": body})
     except requests.ConnectionError:
-        return flask_error(502, "diary server unreachable")
+        return flask_error(502, "route server (8083) unreachable")
+    except requests.Timeout:
+        return flask_error(504, "route server timeout (600s)")
     except Exception as e:
         return flask_error(502, str(e))
 
@@ -242,6 +287,10 @@ def zmq_publish():
         return flask_error(502, f"ZMQ publish failed: {e}")
 
 
+CUSTOM_PROMPT_PATH = "/data/devtools/custom_prompt.txt"
+CUSTOM_LLM_CONFIG_PATH = "/data/devtools/custom_llm_config.json"
+
+
 @app.post("/api/execute")
 def execute_action():
     """LLM classify -> ZMQ publish pipeline."""
@@ -266,26 +315,110 @@ def execute_action():
     mood = parts[0] if parts else text
     instruction = parts[1] if len(parts) > 1 else ""
 
-    if not instruction or instruction == "no_action":
-        return jsonify({"raw": text, "mood": mood, "instruction": instruction, "executed": False})
+    result = {"raw": text, "mood": mood, "instruction": instruction}
 
     # Step 2: Map instruction -> ZMQ publish
-    mapping = ACTION_MAP.get(instruction)
-    if not mapping:
-        return jsonify({"raw": text, "mood": mood, "instruction": instruction, "executed": False,
-                        "error": f"unknown instruction: {instruction}"})
+    if instruction and instruction != "no_action":
+        mapping = ACTION_MAP.get(instruction)
+        if mapping:
+            ts = int(time.time() * 1e9)
+            payload_dict = {"task_type": "voice", "timestamp": ts, **mapping}
+            payload_json = json.dumps(payload_dict, separators=(",", ":"))
+            try:
+                zmq_publish_msg("/agent/start_cc_task", payload_json)
+                result["payload"] = payload_dict
+                result["executed"] = True
+            except Exception:
+                result["executed"] = False
+                result["error"] = "ZMQ publish failed"
+        else:
+            result["executed"] = False
+            result["error"] = f"unknown instruction: {instruction}"
+    else:
+        result["executed"] = False
 
-    ts = int(time.time() * 1e9)
-    payload_dict = {"task_type": "voice", "timestamp": ts, **mapping}
-    payload_json = json.dumps(payload_dict, separators=(",", ":"))
+    return jsonify(result)
 
+
+@app.post("/api/custom-llm")
+def custom_llm_call():
+    """Call diary LLM (Qwen3-1.7B :8082) with custom prompt template."""
+    data = request.get_json(force=True)
+    text = data.get("text", "").strip()
+    if not text:
+        return flask_error(400, "text is required")
+
+    # Read template
+    if not os.path.isfile(CUSTOM_PROMPT_PATH):
+        return flask_error(404, "custom_prompt.txt not found — Prompt tab で設定してください")
     try:
-        zmq_publish_msg("/agent/start_cc_task", payload_json)
-    except Exception:
-        return jsonify({"raw": text, "mood": mood, "instruction": instruction, "executed": False,
-                        "error": "ZMQ publish failed"})
+        with open(CUSTOM_PROMPT_PATH, "r", encoding="utf-8") as f:
+            template = f.read().strip()
+    except Exception as e:
+        return flask_error(500, f"template read error: {e}")
+    if not template:
+        return flask_error(400, "custom_prompt.txt is empty")
 
-    return jsonify({"raw": text, "mood": mood, "instruction": instruction, "payload": payload_dict, "executed": True})
+    # Format template
+    try:
+        filled = template.format(text=text)
+    except (KeyError, IndexError, ValueError) as e:
+        return flask_error(400, f"template format error: {e}")
+
+    # Read config (temperature, max_new_tokens)
+    config = {"temperature": 1.3, "max_new_tokens": 4096}
+    if os.path.isfile(CUSTOM_LLM_CONFIG_PATH):
+        try:
+            with open(CUSTOM_LLM_CONFIG_PATH, "r", encoding="utf-8") as f:
+                config.update(json.loads(f.read()))
+        except Exception:
+            pass
+
+    # Call diary server with retries
+    payload = {
+        "task": config.get("task", "diary"),
+        "prompt": filled,
+        "temperature": float(config.get("temperature", 1.3)),
+        "max_new_tokens": int(config.get("max_new_tokens", 4096)),
+    }
+
+    MAX_RETRIES = 3
+    last_error = None
+    for attempt in range(MAX_RETRIES):
+        try:
+            resp = requests.post(
+                "http://127.0.0.1:8082/rkllm_diary",
+                json=payload,
+                timeout=300,
+            )
+            if resp.status_code == 503:
+                last_error = "LLM server busy"
+                time.sleep(2)
+                continue
+            result_text = resp.text.strip()
+            if result_text:
+                result_text = re.sub(
+                    r"<think>.*?</think>", "", result_text, flags=re.DOTALL
+                ).strip()
+                return jsonify({
+                    "result": result_text,
+                    "prompt": filled,
+                    "attempt": attempt + 1,
+                })
+            last_error = "empty response"
+        except requests.ConnectionError:
+            return flask_error(502, "diary server (8082) unreachable")
+        except requests.Timeout:
+            last_error = "timeout"
+        except Exception as e:
+            last_error = str(e)
+        time.sleep(2)
+
+    return jsonify({
+        "result": "",
+        "error": f"no output after {MAX_RETRIES} attempts ({last_error})",
+        "prompt": filled,
+    })
 
 
 @app.get("/api/health")
@@ -317,6 +450,7 @@ def health_check():
 # --- Camera / Media ---
 
 CAMERA_DIRS = {
+    "media_photo": "/media/photo/",
     "origin": "/data/cache/video_recorder/result/origin/",
     "hand": "/data/cache/video_recorder/result/hand/",
     "photos": "/data/cache/photo/",
@@ -325,6 +459,12 @@ CAMERA_DIRS = {
     "sensor": "/data/cache/recorder/archive/",
     "face_known": "/data/ai_brain_data/face_metadata/known/",
     "face_unknown": "/data/ai_brain_data/face_metadata/unknown/",
+}
+
+# Directories where multiple file variants exist per item (e.g. original + thumb + mini)
+# Only list files matching this extension in summary/list to avoid duplicates
+PHOTO_EXT_FILTER = {
+    "media_photo": ".png",  # /media/photo/ has .png + _mini.jpg + _thumb.jpg per photo
 }
 
 
@@ -346,7 +486,7 @@ def _remove_empty_dirs(path):
         pass
 
 
-def _dir_stats(path, recursive=False):
+def _dir_stats(path, recursive=False, ext_filter=None):
     """Return (count, total_size) for files in a directory."""
     if not os.path.isdir(path):
         return 0, 0
@@ -355,11 +495,15 @@ def _dir_stats(path, recursive=False):
     if recursive:
         for root, _dirs, files in os.walk(path):
             for name in files:
+                if ext_filter and not name.endswith(ext_filter):
+                    continue
                 fp = os.path.join(root, name)
                 count += 1
                 total += os.path.getsize(fp)
     else:
         for name in os.listdir(path):
+            if ext_filter and not name.endswith(ext_filter):
+                continue
             fp = os.path.join(path, name)
             if os.path.isfile(fp):
                 count += 1
@@ -371,7 +515,8 @@ def _dir_stats(path, recursive=False):
 def camera_summary():
     result = {}
     for key, path in CAMERA_DIRS.items():
-        count, total_size = _dir_stats(path, recursive=(key in RECURSIVE_DIRS))
+        ext = PHOTO_EXT_FILTER.get(key)
+        count, total_size = _dir_stats(path, recursive=(key in RECURSIVE_DIRS), ext_filter=ext)
         result[key] = {"count": count, "total_size": total_size}
     return jsonify(result)
 
@@ -386,10 +531,13 @@ def camera_list():
     if not dirpath or not os.path.isdir(dirpath):
         return jsonify({"files": [], "total": 0, "offset": offset, "limit": limit})
 
+    ext_filter = PHOTO_EXT_FILTER.get(cat)
     entries = []
     if cat in RECURSIVE_DIRS:
         for root, _dirs, files in os.walk(dirpath):
             for name in files:
+                if ext_filter and not name.endswith(ext_filter):
+                    continue
                 fp = os.path.join(root, name)
                 relpath = os.path.relpath(fp, dirpath)
                 entries.append({
@@ -399,6 +547,8 @@ def camera_list():
                 })
     else:
         for name in os.listdir(dirpath):
+            if ext_filter and not name.endswith(ext_filter):
+                continue
             fp = os.path.join(dirpath, name)
             if os.path.isfile(fp):
                 entries.append({
@@ -444,10 +594,15 @@ def camera_faces():
         if not os.path.isdir(id_path):
             continue
         info = {"id": entry, "enrolled": [], "recognized_count": 0, "features_count": 0}
-        # enrolled_faces
-        ef_path = os.path.join(id_path, "enrolled_faces")
-        if os.path.isdir(ef_path):
-            info["enrolled"] = sorted(os.listdir(ef_path))[:5]  # max 5 thumbnails
+        # enrolled_faces (known) or faces (unknown)
+        for ef_name in ("enrolled_faces", "faces"):
+            ef_path = os.path.join(id_path, ef_name)
+            if os.path.isdir(ef_path):
+                files_in = [f for f in sorted(os.listdir(ef_path)) if os.path.isfile(os.path.join(ef_path, f))]
+                if files_in:
+                    info["enrolled"] = files_in[:5]  # max 5 thumbnails
+                    info["enrolled_dir"] = ef_name
+                    break
         # recognized_faces
         rf_path = os.path.join(id_path, "recognized_faces")
         if os.path.isdir(rf_path):
@@ -476,7 +631,7 @@ def camera_face_files():
 
     if not face_id or ".." in face_id or ".." in subfolder:
         abort(400)
-    if subfolder not in ("enrolled_faces", "recognized_faces", "features"):
+    if subfolder not in ("enrolled_faces", "recognized_faces", "features", "faces"):
         abort(400)
 
     dirpath = os.path.join(CAMERA_DIRS.get(f"face_{kind}", ""), face_id, subfolder)
@@ -585,6 +740,16 @@ def camera_delete():
             deleted += 1
             if is_face:
                 affected_face_ids.add(fname.split("/")[0])
+            # For /media/photo/: also delete _mini.jpg and _thumb.jpg variants
+            if cat == "media_photo" and fname.endswith(".png"):
+                base = fname[:-4]
+                for suffix in ("_mini.jpg", "_thumb.jpg"):
+                    variant = os.path.join(dirpath, base + suffix)
+                    if os.path.isfile(variant):
+                        try:
+                            os.remove(variant)
+                        except Exception:
+                            pass
         except Exception as e:
             errors.append({"file": fname, "error": str(e)})
 
@@ -620,6 +785,203 @@ def camera_delete():
     })
 
 
+# --- System Prompts & Launch Scripts ---
+
+PROMPT_DIR = "/app/opt/wlab/sweepbot/share/llm_server/res"
+SCRIPT_DIR = "/app/opt/wlab/sweepbot/bin"
+# Mirror paths: overlay writes go here so LLM servers see changes via /opt/...
+_OVERLAY_PROMPT_DIR = "/opt/wlab/sweepbot/share/llm_server/res"
+_OVERLAY_SCRIPT_DIR = "/opt/wlab/sweepbot/bin"
+
+# All editable files: key -> (directory, filename)
+EDITABLE_FILES = {
+    "action":             (PROMPT_DIR, "action_system_prompt.txt"),
+    "action_config":      (SCRIPT_DIR, "llm_action_server.sh"),
+    "diary":              (PROMPT_DIR, "system_prompt_diary.txt"),
+    "diary_config":       (SCRIPT_DIR, "llm_diary_server.sh"),
+    "diary_translation":  (PROMPT_DIR, "system_prompt_diary_translation.txt"),
+    "custom_llm":         ("/data/devtools", "custom_prompt.txt"),
+    "custom_llm_config":  ("/data/devtools", "custom_llm_config.json"),
+}
+
+# LLM services to restart after prompt edit
+LLM_SERVICES = ["llm_action", "llm_diary", "llm_route"]
+
+# Map /app/opt/... dirs to /opt/... dirs for overlay sync
+_OVERLAY_MAP = {PROMPT_DIR: _OVERLAY_PROMPT_DIR, SCRIPT_DIR: _OVERLAY_SCRIPT_DIR}
+
+
+def _editable_path(key):
+    d, f = EDITABLE_FILES[key]
+    return os.path.join(d, f)
+
+
+def _init_overlay_dirs():
+    """Ensure overlay directories exist and are writable on first run."""
+    for overlay_dir in _OVERLAY_MAP.values():
+        try:
+            os.makedirs(overlay_dir, mode=0o777, exist_ok=True)
+        except Exception:
+            pass
+    # Sync all editable files from /app/opt/... to /opt/... on startup
+    for key, (d, fname) in EDITABLE_FILES.items():
+        overlay_dir = _OVERLAY_MAP.get(d)
+        if not overlay_dir:
+            continue
+        src = os.path.join(d, fname)
+        dst = os.path.join(overlay_dir, fname)
+        try:
+            with open(src, "r", encoding="utf-8") as f:
+                content = f.read()
+            with open(dst, "w", encoding="utf-8") as f:
+                f.write(content)
+        except Exception:
+            pass
+
+
+def _sync_to_overlay(directory, filename, content):
+    """Write content to /opt/... overlay path so LLM servers see the change."""
+    overlay_dir = _OVERLAY_MAP.get(directory)
+    if not overlay_dir:
+        return
+    try:
+        dst = os.path.join(overlay_dir, filename)
+        with open(dst, "w", encoding="utf-8") as f:
+            f.write(content)
+    except Exception:
+        pass  # best-effort sync
+
+
+_init_overlay_dirs()
+
+
+@app.get("/api/prompts")
+def get_prompts():
+    """Return all editable files (prompts + launch scripts)."""
+    result = {}
+    for key, (d, fname) in EDITABLE_FILES.items():
+        fpath = os.path.join(d, fname)
+        try:
+            with open(fpath, "r", encoding="utf-8") as f:
+                result[key] = {"filename": fname, "content": f.read()}
+        except Exception as e:
+            result[key] = {"filename": fname, "content": "", "error": str(e)}
+    return jsonify(result)
+
+
+@app.post("/api/prompts/save")
+def save_prompt():
+    """Save an editable file."""
+    data = request.get_json(force=True)
+    key = data.get("key", "")
+    content = data.get("content", "")
+    if key not in EDITABLE_FILES:
+        return flask_error(400, f"unknown key: {key}")
+    fpath = _editable_path(key)
+    try:
+        with open(fpath, "w", encoding="utf-8") as f:
+            f.write(content)
+        d, fname = EDITABLE_FILES[key]
+        _sync_to_overlay(d, fname, content)
+        return jsonify({"status": "ok", "key": key, "size": len(content)})
+    except Exception as e:
+        return flask_error(500, str(e))
+
+
+PROMPT_BACKUP_DIR = "/data/devtools/prompt_backups"
+
+
+@app.get("/api/prompts/backups")
+def list_prompt_backups():
+    """List available prompt backups."""
+    if not os.path.isdir(PROMPT_BACKUP_DIR):
+        return jsonify({"backups": []})
+    backups = []
+    for name in sorted(os.listdir(PROMPT_BACKUP_DIR), reverse=True):
+        bp = os.path.join(PROMPT_BACKUP_DIR, name)
+        if not os.path.isdir(bp):
+            continue
+        files = sorted(os.listdir(bp))
+        backups.append({"name": name, "files": files})
+    return jsonify({"backups": backups})
+
+
+@app.post("/api/prompts/backup")
+def backup_prompts():
+    """Backup all current editable files."""
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    dst = os.path.join(PROMPT_BACKUP_DIR, ts)
+    os.makedirs(dst, exist_ok=True)
+    copied = []
+    for key, (d, fname) in EDITABLE_FILES.items():
+        src = os.path.join(d, fname)
+        if os.path.isfile(src):
+            try:
+                with open(src, "r", encoding="utf-8") as f:
+                    content = f.read()
+                with open(os.path.join(dst, fname), "w", encoding="utf-8") as f:
+                    f.write(content)
+                copied.append(fname)
+            except Exception:
+                pass
+    return jsonify({"status": "ok", "name": ts, "files": copied})
+
+
+@app.post("/api/prompts/restore")
+def restore_prompts():
+    """Restore editable files from a backup."""
+    data = request.get_json(force=True)
+    name = data.get("name", "")
+    if not name or ".." in name or "/" in name:
+        return flask_error(400, "invalid backup name")
+    bp = os.path.join(PROMPT_BACKUP_DIR, name)
+    if not os.path.isdir(bp):
+        return flask_error(404, f"backup not found: {name}")
+    restored = []
+    for key, (d, fname) in EDITABLE_FILES.items():
+        src = os.path.join(bp, fname)
+        dst = os.path.join(d, fname)
+        if os.path.isfile(src):
+            try:
+                with open(src, "r", encoding="utf-8") as f:
+                    content = f.read()
+                with open(dst, "w", encoding="utf-8") as f:
+                    f.write(content)
+                _sync_to_overlay(d, fname, content)
+                restored.append(fname)
+            except Exception as e:
+                return flask_error(500, f"restore failed for {fname}: {e}")
+    return jsonify({"status": "ok", "name": name, "restored": restored})
+
+
+@app.post("/api/prompts/backup/delete")
+def delete_prompt_backup():
+    """Delete a prompt backup."""
+    import shutil
+    data = request.get_json(force=True)
+    name = data.get("name", "")
+    if not name or ".." in name or "/" in name:
+        return flask_error(400, "invalid backup name")
+    bp = os.path.join(PROMPT_BACKUP_DIR, name)
+    if not os.path.isdir(bp):
+        return flask_error(404, f"backup not found: {name}")
+    shutil.rmtree(bp)
+    return jsonify({"status": "ok", "name": name})
+
+
+@app.post("/api/prompts/restart")
+def restart_llm_services():
+    """Restart LLM services to pick up prompt changes."""
+    results = {}
+    for svc in LLM_SERVICES:
+        try:
+            rc = os.system(f"systemctl restart {svc} 2>/dev/null")
+            results[svc] = "ok" if rc == 0 else f"exit code {rc}"
+        except Exception as e:
+            results[svc] = str(e)
+    return jsonify({"status": "ok", "services": results})
+
+
 @app.get("/api/events")
 def get_events():
     """Return recent events from log file."""
@@ -642,11 +1004,15 @@ def get_events():
 
 @app.route("/")
 def index():
-    return send_from_directory(app.static_folder, "index.html")
+    resp = send_from_directory(app.static_folder, "index.html")
+    resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+    resp.headers["Pragma"] = "no-cache"
+    resp.headers["Expires"] = "0"
+    return resp
 
 
 if __name__ == "__main__":
     _ensure_config()
     print(f"[DevTools] Device ID: {DEVICE_ID or '(not found)'}")
     print(f"[DevTools] Token: {'***' + LOCAL_TOKEN[-4:] if LOCAL_TOKEN else '(not found)'}")
-    app.run(host="0.0.0.0", port=9001, debug=False)
+    app.run(host="0.0.0.0", port=9001, debug=False, threaded=True)

@@ -28,6 +28,19 @@
     .sel-check.checked { background: #f59e0b; border-color: #f59e0b; }
     .sel-ring { ring: 2px solid #f59e0b; }
     .card-selected { outline: 3px solid #f59e0b; outline-offset: -3px; }
+    /* Log panel */
+    #log-panel { position: fixed; top: 0; right: 0; width: 380px; height: 100vh; background: #0f172a; border-left: 1px solid #334155; z-index: 50; display: flex; flex-direction: column; }
+    #log-panel.collapsed { width: 36px; }
+    #log-panel.collapsed #log-content, #log-panel.collapsed #log-header-controls { display: none; }
+    #log-content { flex: 1; overflow-y: auto; font-family: ui-monospace, monospace; font-size: 11px; line-height: 1.4; }
+    .log-entry { border-bottom: 1px solid #1e293b; padding: 4px 8px; }
+    .log-req { color: #60a5fa; }
+    .log-res-ok { color: #34d399; }
+    .log-res-err { color: #f87171; }
+    .log-time { color: #64748b; }
+    .log-body { color: #94a3b8; margin-top: 2px; max-height: 120px; overflow-y: auto; white-space: pre-wrap; word-break: break-all; }
+    body.log-open { margin-right: 380px; }
+    body.log-closed { margin-right: 36px; }
   </style>
 </head>
 <body class="bg-gray-900 text-gray-100 min-h-screen">
@@ -42,6 +55,8 @@
       <button onclick="switchTab('diary')" id="tab-diary" class="px-4 py-2 border-b-2 border-transparent hover:text-kata-500 transition">Diary</button>
       <button onclick="switchTab('local')" id="tab-local" class="px-4 py-2 border-b-2 border-transparent hover:text-kata-500 transition">Local API</button>
       <button onclick="switchTab('camera')" id="tab-camera" class="px-4 py-2 border-b-2 border-transparent hover:text-kata-500 transition">Camera</button>
+      <button onclick="switchTab('custom')" id="tab-custom" class="px-4 py-2 border-b-2 border-transparent hover:text-kata-500 transition">Custom LLM</button>
+      <button onclick="switchTab('prompt')" id="tab-prompt" class="px-4 py-2 border-b-2 border-transparent hover:text-kata-500 transition">Prompt</button>
       <button onclick="switchTab('events')" id="tab-events" class="px-4 py-2 border-b-2 border-transparent hover:text-kata-500 transition">Events</button>
       <button onclick="switchTab('status')" id="tab-status" class="px-4 py-2 border-b-2 border-transparent hover:text-kata-500 transition">Status</button>
     </div>
@@ -67,7 +82,7 @@
           <button onclick="executeAction('ハイタッチ')" class="bg-gray-700 hover:bg-gray-600 px-3 py-1 rounded text-sm transition">ハイタッチ</button>
         </div>
       </div>
-      <p class="text-xs text-gray-500 mb-3">「判定のみ」= LLMのmood/instruction応答を確認。「実行」= LLM判定 → ZMQ publish でデバイスを動かす。</p>
+      <p class="text-xs text-gray-500 mb-3">「判定のみ」= LLMのmood/instruction応答を確認。「実行」= LLM判定 → ZMQ publish でロボットを動かす。</p>
       <div id="action-result" class="bg-gray-800 rounded p-4 min-h-[100px] hidden">
         <pre class="json text-sm"></pre>
       </div>
@@ -99,20 +114,48 @@
 
     <!-- Diary Tab -->
     <div id="panel-diary" class="tab-panel hidden">
-      <div class="mb-4">
-        <label class="block text-sm text-gray-400 mb-1">イベントリスト (1行ずつ)</label>
-        <textarea id="diary-events" rows="5" placeholder="散歩に行った&#10;ご飯を食べた&#10;撫でてもらった" class="w-full bg-gray-800 border border-gray-600 rounded px-3 py-2 focus:outline-none focus:border-kata-500"></textarea>
+      <!-- Event History -->
+      <div class="flex items-center gap-2 mb-4">
+        <h3 class="text-sm font-medium text-gray-300">イベント履歴</h3>
+        <div class="flex gap-1 ml-3">
+          <button onclick="switchEventLang('ja')" data-lang="ja" class="ev-lang-btn bg-gray-700 hover:bg-gray-600 px-2 py-0.5 rounded text-xs">日本語</button>
+          <button onclick="switchEventLang('en')" data-lang="en" class="ev-lang-btn bg-kata-500 text-black px-2 py-0.5 rounded text-xs font-medium">English</button>
+          <button onclick="switchEventLang('zh')" data-lang="zh" class="ev-lang-btn bg-gray-700 hover:bg-gray-600 px-2 py-0.5 rounded text-xs">中文</button>
+        </div>
+        <button onclick="loadDiaryRecords()" class="ml-auto bg-gray-700 hover:bg-gray-600 px-3 py-1.5 rounded text-sm transition">更新</button>
       </div>
-      <div class="flex gap-2 mb-4">
-        <select id="diary-lang" class="bg-gray-800 border border-gray-600 rounded px-3 py-2">
-          <option value="ja">日本語</option>
-          <option value="en">English</option>
-          <option value="zh">中文</option>
-        </select>
-        <button onclick="generateDiary()" id="diary-send" class="bg-kata-500 hover:bg-kata-600 text-black font-medium px-4 py-2 rounded transition">日記生成</button>
+      <div id="diary-dates" class="space-y-3 mb-6"></div>
+      <!-- Manual Generation -->
+      <div class="border-t border-gray-700 pt-4">
+        <h3 class="text-sm font-medium text-gray-300 mb-3">手動生成</h3>
+        <div class="mb-3">
+          <label class="block text-sm text-gray-400 mb-1">イベント (1行ずつ)</label>
+          <textarea id="diary-events" rows="4" placeholder="10:00 - 散歩に行った&#10;12:00 - ご飯を食べた" class="w-full bg-gray-800 border border-gray-600 rounded px-3 py-2 text-sm focus:outline-none focus:border-kata-500"></textarea>
+        </div>
+        <div class="flex gap-2 mb-3">
+          <select id="diary-lang" class="bg-gray-800 border border-gray-600 rounded px-3 py-2 text-sm">
+            <option value="ja">日本語</option>
+            <option value="en">English</option>
+            <option value="zh">中文</option>
+          </select>
+          <button onclick="generateDiary()" id="diary-send" class="bg-kata-500 hover:bg-kata-600 text-black font-medium px-4 py-2 rounded text-sm transition">生成 (約2-3分)</button>
+        </div>
       </div>
-      <div id="diary-result" class="bg-gray-800 rounded p-4 min-h-[100px] hidden">
-        <pre class="json text-sm"></pre>
+      <!-- Generated Result -->
+      <div id="diary-result" class="hidden mt-4">
+        <div id="diary-card" class="bg-gray-800 rounded-lg overflow-hidden">
+          <div class="px-5 py-4">
+            <div class="flex items-center gap-2 mb-2">
+              <span id="diary-emotion" class="text-2xl"></span>
+              <h2 id="diary-title" class="text-lg font-bold text-kata-500"></h2>
+            </div>
+            <p id="diary-content" class="text-sm text-gray-200 leading-relaxed whitespace-pre-wrap"></p>
+          </div>
+        </div>
+        <details class="mt-2">
+          <summary class="text-xs text-gray-500 cursor-pointer">Raw JSON</summary>
+          <pre class="json text-xs text-gray-500 mt-1 bg-gray-800 rounded p-3"></pre>
+        </details>
       </div>
     </div>
 
@@ -145,15 +188,16 @@
     <!-- Camera Tab -->
     <div id="panel-camera" class="tab-panel hidden">
       <!-- Sub-tabs -->
-      <div class="flex gap-1 mb-4">
-        <button onclick="switchCameraSub('origin')" id="camsub-origin" class="bg-kata-500 text-black px-3 py-1.5 rounded text-sm font-medium transition">📷 原本</button>
-        <button onclick="switchCameraSub('hand')" id="camsub-hand" class="bg-gray-700 hover:bg-gray-600 px-3 py-1.5 rounded text-sm transition">✋ 手検出</button>
-        <button onclick="switchCameraSub('photos')" id="camsub-photos" class="bg-gray-700 hover:bg-gray-600 px-3 py-1.5 rounded text-sm transition">🖼 撮影写真</button>
+      <div class="flex flex-wrap gap-1 mb-4">
+        <button onclick="switchCameraSub('media_photo')" id="camsub-media_photo" class="bg-kata-500 text-black px-3 py-1.5 rounded text-sm font-medium transition">📸 撮影写真</button>
         <button onclick="switchCameraSub('face_known')" id="camsub-face_known" class="bg-gray-700 hover:bg-gray-600 px-3 py-1.5 rounded text-sm transition">😀 顔(既知)</button>
         <button onclick="switchCameraSub('face_unknown')" id="camsub-face_unknown" class="bg-gray-700 hover:bg-gray-600 px-3 py-1.5 rounded text-sm transition">❓ 顔(未知)</button>
-        <button onclick="switchCameraSub('video')" id="camsub-video" class="bg-gray-700 hover:bg-gray-600 px-3 py-1.5 rounded text-sm transition">🎬 録画</button>
-        <button onclick="switchCameraSub('video_archive')" id="camsub-video_archive" class="bg-gray-700 hover:bg-gray-600 px-3 py-1.5 rounded text-sm transition">📼 録画AR</button>
-        <button onclick="switchCameraSub('sensor')" id="camsub-sensor" class="bg-gray-700 hover:bg-gray-600 px-3 py-1.5 rounded text-sm transition">📡 センサー</button>
+        <button onclick="switchCameraSub('origin')" id="camsub-origin" class="bg-gray-700 hover:bg-gray-600 px-3 py-1.5 rounded text-sm transition">📷 録画フレーム(cache)</button>
+        <button onclick="switchCameraSub('hand')" id="camsub-hand" class="bg-gray-700 hover:bg-gray-600 px-3 py-1.5 rounded text-sm transition">✋ 手検出(cache)</button>
+        <button onclick="switchCameraSub('photos')" id="camsub-photos" class="bg-gray-700 hover:bg-gray-600 px-3 py-1.5 rounded text-sm transition">🖼 写真(cache)</button>
+        <button onclick="switchCameraSub('video')" id="camsub-video" class="bg-gray-700 hover:bg-gray-600 px-3 py-1.5 rounded text-sm transition">🎬 録画(cache)</button>
+        <button onclick="switchCameraSub('video_archive')" id="camsub-video_archive" class="bg-gray-700 hover:bg-gray-600 px-3 py-1.5 rounded text-sm transition">📼 録画AR(cache)</button>
+        <button onclick="switchCameraSub('sensor')" id="camsub-sensor" class="bg-gray-700 hover:bg-gray-600 px-3 py-1.5 rounded text-sm transition">📡 センサー(cache)</button>
       </div>
       <!-- Summary + Select toggle -->
       <div class="flex items-center gap-3 mb-2">
@@ -174,9 +218,9 @@
       <!-- Grid / List -->
       <div id="camera-grid" class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-3"></div>
       <div id="camera-filelist" class="space-y-2 hidden"></div>
-      <!-- Load more -->
-      <div id="camera-loadmore" class="mt-4 text-center hidden">
-        <button onclick="loadMoreCamera()" class="bg-gray-700 hover:bg-gray-600 px-4 py-2 rounded text-sm transition">もっと読み込む</button>
+      <!-- Infinite scroll sentinel -->
+      <div id="camera-sentinel" class="h-16 flex items-center justify-center">
+        <div id="camera-loading" class="hidden text-gray-500 text-sm">読み込み中...</div>
       </div>
     </div>
 
@@ -186,6 +230,67 @@
         <button onclick="closeModal()" class="absolute -top-10 right-0 text-gray-400 hover:text-white text-2xl">&times;</button>
         <img id="modal-img" src="" class="w-full rounded" alt="">
         <div id="modal-info" class="text-sm text-gray-400 mt-2"></div>
+      </div>
+    </div>
+
+    <!-- Custom LLM Tab -->
+    <div id="panel-custom" class="tab-panel hidden">
+      <div class="mb-4">
+        <label class="block text-sm text-gray-400 mb-1">テキスト入力</label>
+        <textarea id="custom-input" rows="4" placeholder="テキストを入力... (テンプレートの {text} に代入されます)" class="w-full bg-gray-800 border border-gray-600 rounded px-3 py-2 focus:outline-none focus:border-kata-500"></textarea>
+      </div>
+      <div class="flex gap-2 mb-4">
+        <button onclick="callCustomLLM()" id="custom-send" class="bg-kata-500 hover:bg-kata-600 text-black font-medium px-4 py-2 rounded transition">実行</button>
+      </div>
+      <p class="text-xs text-gray-500 mb-3">Prompt タブの「Custom LLM プロンプト」にテンプレートを設定。入力テキストが <code class="text-gray-400">{text}</code> に代入されます。「起動設定」で temperature / max_new_tokens を調整可能。日記LLM (Qwen3-1.7B :8082) を使用。</p>
+      <div id="custom-result" class="bg-gray-800 rounded p-4 min-h-[100px] hidden">
+        <pre class="text-sm whitespace-pre-wrap"></pre>
+      </div>
+      <div id="custom-prompt-preview" class="hidden mt-3">
+        <details>
+          <summary class="text-xs text-gray-500 cursor-pointer">送信プロンプト</summary>
+          <pre class="text-xs text-gray-500 mt-1 bg-gray-800 rounded p-3 whitespace-pre-wrap"></pre>
+        </details>
+      </div>
+    </div>
+
+    <!-- Prompt Tab -->
+    <div id="panel-prompt" class="tab-panel hidden">
+      <div class="flex items-center gap-2 mb-4">
+        <select id="prompt-select" onchange="loadPrompt()" class="bg-gray-800 border border-gray-600 rounded px-3 py-2">
+          <optgroup label="アクション">
+            <option value="action">プロンプト</option>
+            <option value="action_config">起動設定 (.sh)</option>
+          </optgroup>
+          <optgroup label="日記">
+            <option value="diary">プロンプト</option>
+            <option value="diary_config">起動設定 (.sh)</option>
+          </optgroup>
+          <optgroup label="翻訳">
+            <option value="diary_translation">プロンプト</option>
+          </optgroup>
+          <optgroup label="カスタム">
+            <option value="custom_llm">Custom LLM プロンプト</option>
+            <option value="custom_llm_config">起動設定 (.json)</option>
+          </optgroup>
+        </select>
+        <span id="prompt-filename" class="text-sm text-gray-500"></span>
+        <button onclick="loadAllPrompts()" class="ml-auto bg-gray-700 hover:bg-gray-600 px-3 py-1.5 rounded text-sm transition">再読込</button>
+      </div>
+      <textarea id="prompt-editor" rows="20" class="w-full bg-gray-800 border border-gray-600 rounded px-3 py-2 font-mono text-sm leading-relaxed focus:outline-none focus:border-kata-500 resize-y" spellcheck="false"></textarea>
+      <div class="flex items-center gap-2 mt-3">
+        <button onclick="savePrompt()" id="prompt-save" class="bg-kata-500 hover:bg-kata-600 text-black font-medium px-4 py-2 rounded transition">保存</button>
+        <button onclick="saveAndRestart()" id="prompt-restart" class="bg-green-600 hover:bg-green-700 text-white font-medium px-4 py-2 rounded transition">保存 + LLM再起動</button>
+        <span id="prompt-status" class="text-sm ml-2"></span>
+      </div>
+      <p class="text-xs text-gray-500 mt-2">「保存」= ファイルのみ更新。「保存 + LLM再起動」= 保存後に llm_action / llm_diary / llm_route を restart して反映。</p>
+      <!-- Backup / Restore -->
+      <div class="mt-6 border-t border-gray-700 pt-4">
+        <div class="flex items-center gap-2 mb-3">
+          <h3 class="text-sm font-medium text-gray-300">バックアップ / 復元</h3>
+          <button onclick="backupPrompts()" id="prompt-backup-btn" class="ml-auto bg-blue-600 hover:bg-blue-700 text-white px-3 py-1.5 rounded text-sm transition">バックアップ作成</button>
+        </div>
+        <div id="prompt-backups" class="space-y-2"></div>
       </div>
     </div>
 
@@ -210,7 +315,7 @@
 
 <script>
 // --- Tab switching ---
-const tabs = ['action', 'zmq', 'diary', 'local', 'camera', 'events', 'status'];
+const tabs = ['action', 'zmq', 'diary', 'local', 'camera', 'custom', 'prompt', 'events', 'status'];
 function switchTab(name) {
   tabs.forEach(t => {
     document.getElementById(`panel-${t}`).classList.toggle('hidden', t !== name);
@@ -242,11 +347,36 @@ function setLoading(btnId, loading) {
 }
 
 async function apiCall(url, options = {}) {
-  const resp = await fetch(url, {
-    headers: { 'Content-Type': 'application/json' },
-    ...options,
-  });
-  return resp.json();
+  const method = (options.method || 'GET').toUpperCase();
+  const reqBody = options.body ? JSON.parse(options.body) : null;
+  const t0 = performance.now();
+  addLog(`<span class="log-time">${logTime()}</span> <span class="log-req">${method} ${url}</span>${reqBody ? `<div class="log-body">${truncBody(reqBody)}</div>` : ''}`);
+  updateLogCount();
+  try {
+    const resp = await fetch(url, {
+      headers: { 'Content-Type': 'application/json' },
+      ...options,
+    });
+    const text = await resp.text();
+    const ms = Math.round(performance.now() - t0);
+    let data;
+    try { data = JSON.parse(text); } catch { throw new Error(text.slice(0, 200) || `HTTP ${resp.status}`); }
+    const cls = resp.ok ? 'log-res-ok' : 'log-res-err';
+    addLog(`<span class="log-time">${logTime()}</span> <span class="${cls}">${resp.status} ${url} (${ms}ms)</span><div class="log-body">${truncBody(data)}</div>`);
+    updateLogCount();
+    if (!resp.ok) throw new Error(data.detail || `HTTP ${resp.status}`);
+    return data;
+  } catch (e) {
+    const ms = Math.round(performance.now() - t0);
+    addLog(`<span class="log-time">${logTime()}</span> <span class="log-res-err">ERR ${url} (${ms}ms): ${e.message}</span>`);
+    updateLogCount();
+    throw e;
+  }
+}
+
+function updateLogCount() {
+  const el = document.getElementById('log-count');
+  if (el) el.textContent = document.getElementById('log-content')?.children.length || 0;
 }
 
 // --- Action ---
@@ -288,6 +418,38 @@ async function executeAction(preset) {
   setLoading('action-exec', false);
 }
 
+// --- Custom LLM ---
+async function callCustomLLM() {
+  const text = document.getElementById('custom-input').value.trim();
+  if (!text) return;
+  setLoading('custom-send', true);
+  const resultEl = document.getElementById('custom-result');
+  resultEl.classList.remove('hidden');
+  resultEl.querySelector('pre').textContent = '推論中... (最大2分)';
+  try {
+    const data = await apiCall('/api/custom-llm', {
+      method: 'POST',
+      body: JSON.stringify({ text }),
+    });
+    if (data.error) {
+      resultEl.querySelector('pre').textContent = 'エラー: ' + data.error;
+    } else {
+      resultEl.querySelector('pre').textContent = data.result || '(empty response)';
+    }
+    const preview = document.getElementById('custom-prompt-preview');
+    if (data.prompt) {
+      preview.classList.remove('hidden');
+      preview.querySelector('pre').textContent = data.prompt;
+    } else {
+      preview.classList.add('hidden');
+    }
+  } catch (e) {
+    resultEl.querySelector('pre').textContent = 'エラー: ' + e.message;
+    document.getElementById('custom-prompt-preview').classList.add('hidden');
+  }
+  setLoading('custom-send', false);
+}
+
 // --- ZMQ Publish ---
 async function zmqPublish() {
   const topic = document.getElementById('zmq-topic').value;
@@ -314,20 +476,164 @@ async function zmqPublish() {
 }
 
 // --- Diary ---
+const EMOTION_ICONS = {
+  'Loved': '\u2764\uFE0F', 'Happy': '\uD83D\uDE04', 'Excited': '\uD83E\uDD29',
+  'Calm': '\uD83D\uDE0C', 'Grateful': '\uD83D\uDE4F', 'Curious': '\uD83E\uDD14',
+  'Playful': '\uD83D\uDE1C', 'Sleepy': '\uD83D\uDE34', 'Sad': '\uD83D\uDE22',
+  'Bored': '\uD83D\uDE10', 'Lonely': '\uD83E\uDD7A', 'Scared': '\uD83D\uDE28',
+};
+
+const EVENT_I18N = {
+  '唱了一首歌':       { ja: '歌を歌った', en: 'Sang a song' },
+  '在家里探索了一番': { ja: '家の中を探検した', en: 'Explored around the house' },
+  '在家里溜达':       { ja: '家の中をうろうろした', en: 'Wandered around the house' },
+  '小憩了一下':       { ja: 'ちょっと休憩した', en: 'Took a short nap' },
+  '得到了很多爱抚':   { ja: 'たくさん撫でてもらった', en: 'Got lots of cuddles' },
+  '打了个招呼':       { ja: '挨拶した', en: 'Said hello' },
+  '熟悉了一下新环境': { ja: '新しい環境に慣れた', en: 'Got familiar with new surroundings' },
+  '睡了一觉':         { ja: '寝ていた', en: 'Had a sleep' },
+  '睡觉并做了个梦':   { ja: '寝て夢を見た', en: 'Slept and had a dream' },
+  '被叫了名字':       { ja: '名前を呼ばれた', en: 'Got called by name' },
+  '被抚摸了':         { ja: '撫でてもらった', en: 'Got petted' },
+  '被拥抱了':         { ja: '抱っこされた', en: 'Got hugged' },
+  '被摸了耳朵':       { ja: '耳を触られた', en: 'Got ears touched' },
+  '被摸了肚子':       { ja: 'お腹を触られた', en: 'Got belly rubbed' },
+  '被摸了脸':         { ja: '顔を触られた', en: 'Got face touched' },
+  '说了早上好':       { ja: 'おはようと言った', en: 'Said good morning' },
+  '跟随音乐跳了个舞': { ja: '音楽に合わせて踊った', en: 'Danced to music' },
+  '醒来啦':           { ja: '起きた', en: 'Woke up' },
+  '陪伴主人':         { ja: '飼い主と一緒にいた', en: 'Accompanied owner' },
+};
+
+let eventLang = 'en';
+
+function translateEvent(zh) {
+  if (eventLang === 'zh') return zh;
+  const t = EVENT_I18N[zh];
+  return t ? t[eventLang] : zh;
+}
+
+function renderDiaryCard(d) {
+  const icon = EMOTION_ICONS[d.emotion] || d.emotion || '';
+  return `<div class="mt-3 pt-3 border-t border-gray-700">
+    <div class="flex items-center gap-2 mb-1">
+      <span class="text-xl">${icon}</span>
+      <span class="font-bold text-kata-500">${d.title || ''}</span>
+    </div>
+    <p class="text-sm text-gray-200 leading-relaxed whitespace-pre-wrap">${d.diary || ''}</p>
+    ${d.generated_at ? `<span class="text-xs text-gray-600 mt-1 block">${d.generated_at}</span>` : ''}
+  </div>`;
+}
+
+async function loadDiaryRecords() {
+  const container = document.getElementById('diary-dates');
+  container.innerHTML = '<p class="text-gray-500 text-sm">読み込み中...</p>';
+  try {
+    const data = await apiCall('/api/diary/records');
+    diaryRecordsCache = data;
+    const events = data.events || {};
+    const generated = data.generated || {};
+    const dates = Object.keys(events).sort().reverse();
+    if (!dates.length) {
+      container.innerHTML = '<p class="text-gray-500 text-sm">イベントなし</p>';
+      return;
+    }
+    container.innerHTML = dates.map(date => {
+      const evList = events[date] || [];
+      const seen = new Set();
+      const unique = evList.filter(e => {
+        const key = (e.time || '').split(':')[0] + ':' + (e.event || '');
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      });
+      const evHtml = unique.slice(0, 10).map(e =>
+        `<span class="inline-block bg-gray-700 rounded px-2 py-0.5 text-xs mr-1 mb-1">${e.time || ''} ${translateEvent(e.event || '')}</span>`
+      ).join('') + (unique.length > 10 ? `<span class="text-xs text-gray-500">...+${unique.length - 10}</span>` : '');
+      const saved = generated[date];
+      const diaryHtml = saved ? renderDiaryCard(saved) : '';
+      return `<div class="bg-gray-800 rounded p-4">
+        <div class="flex items-center gap-3 mb-2">
+          <span class="font-mono text-sm font-medium text-kata-500">${date}</span>
+          <span class="text-xs text-gray-500">${unique.length}件</span>
+          <button onclick="generateFromDate('${date}')" class="ml-auto bg-kata-500 hover:bg-kata-600 text-black px-3 py-1 rounded text-xs font-medium transition">${saved ? '再生成' : '日記生成'}</button>
+        </div>
+        <div class="flex flex-wrap">${evHtml}</div>
+        <div id="diary-gen-${date}">${diaryHtml}</div>
+      </div>`;
+    }).join('');
+  } catch (e) {
+    container.innerHTML = `<p class="text-red-400 text-sm">${e.message}</p>`;
+  }
+}
+
+function switchEventLang(lang) {
+  eventLang = lang;
+  document.querySelectorAll('.ev-lang-btn').forEach(b => {
+    b.className = b.dataset.lang === lang
+      ? 'ev-lang-btn bg-kata-500 text-black px-2 py-0.5 rounded text-xs font-medium'
+      : 'ev-lang-btn bg-gray-700 hover:bg-gray-600 px-2 py-0.5 rounded text-xs';
+  });
+  loadDiaryRecords();
+}
+
+let diaryRecordsCache = null;
+
+async function generateFromDate(date) {
+  const genEl = document.getElementById(`diary-gen-${date}`);
+  genEl.classList.remove('hidden');
+  genEl.innerHTML = '<p class="text-gray-400 text-sm">生成中... (約2-3分かかります)</p>';
+  try {
+    if (!diaryRecordsCache) {
+      diaryRecordsCache = await apiCall('/api/diary/records');
+    }
+    const events = diaryRecordsCache.events[date] || [];
+    const language = document.getElementById('diary-lang').value;
+    const data = await apiCall('/api/diary', {
+      method: 'POST',
+      body: JSON.stringify({ events, language, local_date: date }),
+    });
+    if (data.title && data.diary) {
+      genEl.innerHTML = renderDiaryCard(data);
+      // Update button text to 再生成
+      const btn = genEl.parentElement.querySelector('button');
+      if (btn) btn.textContent = '再生成';
+    } else {
+      genEl.innerHTML = `<pre class="text-xs text-gray-400">${JSON.stringify(data, null, 2)}</pre>`;
+    }
+  } catch (e) {
+    genEl.innerHTML = `<p class="text-red-400 text-sm">${e.message}</p>`;
+  }
+}
+
 async function generateDiary() {
   const raw = document.getElementById('diary-events').value.trim();
   if (!raw) return;
   const events = raw.split('\n').filter(l => l.trim());
   const language = document.getElementById('diary-lang').value;
   setLoading('diary-send', true);
+  const resultEl = document.getElementById('diary-result');
+  resultEl.classList.remove('hidden');
+  document.getElementById('diary-title').textContent = '';
+  document.getElementById('diary-content').textContent = '生成中... (約2-3分かかります)';
+  document.getElementById('diary-emotion').textContent = '';
   try {
     const data = await apiCall('/api/diary', {
       method: 'POST',
       body: JSON.stringify({ events, language, local_date: new Date().toISOString().slice(0, 10) }),
     });
-    showResult('diary-result', data);
+    if (data.title && data.diary) {
+      const icon = EMOTION_ICONS[data.emotion] || data.emotion || '';
+      document.getElementById('diary-emotion').textContent = icon;
+      document.getElementById('diary-title').textContent = data.title;
+      document.getElementById('diary-content').textContent = data.diary;
+    } else {
+      document.getElementById('diary-content').textContent = data.raw || JSON.stringify(data, null, 2);
+    }
+    resultEl.querySelector('pre.json').textContent = JSON.stringify(data, null, 2);
   } catch (e) {
-    showResult('diary-result', { error: e.message });
+    document.getElementById('diary-content').textContent = 'エラー: ' + e.message;
+    resultEl.querySelector('pre.json').textContent = e.message;
   }
   setLoading('diary-send', false);
 }
@@ -404,12 +710,12 @@ function toggleAutoRefresh() {
 }
 
 // --- Camera ---
-let cameraSub = 'origin';
+let cameraSub = 'media_photo';
 let cameraOffset = 0;
 let cameraSummary = {};
 const CAMERA_LIMIT = 20;
-const CAM_SUBS = ['origin','hand','photos','face_known','face_unknown','video','video_archive','sensor'];
-const PHOTO_TYPES = ['origin', 'hand', 'photos'];
+const CAM_SUBS = ['media_photo','face_known','face_unknown','origin','hand','photos','video','video_archive','sensor'];
+const PHOTO_TYPES = ['media_photo', 'origin', 'hand', 'photos'];
 const FACE_TYPES = ['face_known', 'face_unknown'];
 const FILE_TYPES = ['video', 'video_archive', 'sensor'];
 
@@ -572,6 +878,8 @@ function switchCameraSub(type) {
 
 async function loadCameraTab() {
   cameraOffset = 0;
+  cameraHasMore = false;
+  cameraLoading = false;
   try {
     cameraSummary = await apiCall('/api/camera/summary');
   } catch {}
@@ -606,7 +914,7 @@ function formatDate(ts) {
 async function loadFaceCards() {
   const grid = document.getElementById('camera-grid');
   const filelist = document.getElementById('camera-filelist');
-  const loadmore = document.getElementById('camera-loadmore');
+  const loadmore = document.getElementById('camera-loading');
   grid.classList.add('hidden');
   filelist.classList.remove('hidden');
   filelist.innerHTML = '';
@@ -635,12 +943,13 @@ async function loadFaceCards() {
       const isSelected = selectMode && selectedFaceIds.has(face.id);
       if (isSelected) card.classList.add('card-selected');
 
-      // Thumbnail row from enrolled_faces
+      // Thumbnail row from enrolled_faces or faces
+      const enrolledDir = face.enrolled_dir || 'enrolled_faces';
       const thumbs = face.enrolled.filter(n => /\.(jpe?g|png)$/i.test(n)).slice(0, 4);
       const thumbHtml = thumbs.map(n =>
-        `<img src="/api/camera/photo/${cameraSub}/${face.id}/enrolled_faces/${n}" loading="lazy"
+        `<img src="/api/camera/photo/${cameraSub}/${face.id}/${enrolledDir}/${n}" loading="lazy"
               class="w-16 h-16 object-cover rounded cursor-pointer hover:ring-2 hover:ring-kata-500"
-              onclick="event.stopPropagation(); openModal('${cameraSub}', {name:'${face.id}/enrolled_faces/${n}', size:0, mtime:0})">`
+              onclick="event.stopPropagation(); openModal('${cameraSub}', {name:'${face.id}/${enrolledDir}/${n}', size:0, mtime:0})">`
       ).join('');
 
       const cbHtml = selectMode
@@ -664,7 +973,7 @@ async function loadFaceCards() {
         <div class="mt-2 flex gap-2 ${selectMode ? 'ml-8' : ''}">
           <button onclick="toggleFaceDetail('${kind}','${face.id}','recognized_faces')"
                   class="text-xs bg-gray-700 hover:bg-gray-600 px-2 py-1 rounded transition">認識写真を表示</button>
-          <button onclick="toggleFaceDetail('${kind}','${face.id}','enrolled_faces')"
+          <button onclick="toggleFaceDetail('${kind}','${face.id}','${enrolledDir}')"
                   class="text-xs bg-gray-700 hover:bg-gray-600 px-2 py-1 rounded transition">登録写真</button>
         </div>`;
       if (selectMode) {
@@ -771,7 +1080,7 @@ async function loadCameraFiles(append) {
   const isPhoto = PHOTO_TYPES.includes(cameraSub);
   const grid = document.getElementById('camera-grid');
   const filelist = document.getElementById('camera-filelist');
-  const loadmore = document.getElementById('camera-loadmore');
+  const loadmore = document.getElementById('camera-loading');
 
   if (!append) {
     grid.innerHTML = '';
@@ -792,8 +1101,12 @@ async function loadCameraFiles(append) {
         const checkHtml = selectMode
           ? `<div class="sel-check ${isSelected ? 'checked' : ''}" data-selname="${f.name}">✓</div>`
           : '';
+        // For /media/photo/: use _thumb.jpg for grid, .png original for modal
+        const thumbSrc = cameraSub === 'media_photo' && f.name.endsWith('.png')
+          ? `/api/camera/photo/${cameraSub}/${f.name.replace('.png', '_thumb.jpg')}`
+          : `/api/camera/photo/${cameraSub}/${f.name}`;
         card.innerHTML = `${checkHtml}
-          <img src="/api/camera/photo/${cameraSub}/${f.name}" loading="lazy" class="w-full h-32 object-cover" alt="${f.name}">
+          <img src="${thumbSrc}" loading="lazy" class="w-full h-32 object-cover" alt="${f.name}">
           <div class="px-2 py-1.5">
             <div class="text-xs text-gray-400 truncate">${formatDate(f.mtime)}</div>
             <div class="text-xs text-gray-500">${formatSize(f.size)}</div>
@@ -839,22 +1152,44 @@ async function loadCameraFiles(append) {
     }
 
     const shown = cameraOffset + data.files.length;
-    loadmore.classList.toggle('hidden', shown >= data.total || data.files.length === 0);
+    cameraHasMore = shown < data.total && data.files.length > 0;
+    cameraLoading = false;
+    document.getElementById('camera-loading').classList.add('hidden');
   } catch (e) {
     (isPhoto ? grid : filelist).innerHTML = `<p class="text-red-400 col-span-4">${e.message}</p>`;
-    loadmore.classList.add('hidden');
+    cameraHasMore = false;
+    cameraLoading = false;
+    document.getElementById('camera-loading').classList.add('hidden');
   }
 }
 
-function loadMoreCamera() {
-  cameraOffset += CAMERA_LIMIT;
-  loadCameraFiles(true);
-}
+// --- Infinite scroll ---
+let cameraHasMore = false;
+let cameraLoading = false;
+const cameraObserver = new IntersectionObserver((entries) => {
+  if (entries[0].isIntersecting && cameraHasMore && !cameraLoading) {
+    cameraOffset += CAMERA_LIMIT;
+    cameraLoading = true;
+    document.getElementById('camera-loading').classList.remove('hidden');
+    loadCameraFiles(true);
+  }
+}, { rootMargin: '200px' });
+cameraObserver.observe(document.getElementById('camera-sentinel'));
 
 function openModal(type, file) {
   const modal = document.getElementById('photo-modal');
-  document.getElementById('modal-img').src = `/api/camera/photo/${type}/${file.name}`;
-  document.getElementById('modal-info').textContent = `${file.name} · ${formatSize(file.size)} · ${formatDate(file.mtime)}`;
+  // For /media/photo/: use _mini.jpg for faster modal load, link to original .png
+  const modalSrc = type === 'media_photo' && file.name.endsWith('.png')
+    ? `/api/camera/photo/${type}/${file.name.replace('.png', '_mini.jpg')}`
+    : `/api/camera/photo/${type}/${file.name}`;
+  document.getElementById('modal-img').src = modalSrc;
+  const info = `${file.name} · ${formatSize(file.size)} · ${formatDate(file.mtime)}`;
+  const infoEl = document.getElementById('modal-info');
+  if (type === 'media_photo' && file.name.endsWith('.png')) {
+    infoEl.innerHTML = `${info} · <a href="/api/camera/photo/${type}/${file.name}" target="_blank" class="text-kata-500 hover:underline">原寸PNG</a>`;
+  } else {
+    infoEl.textContent = info;
+  }
   modal.classList.remove('hidden');
 }
 
@@ -864,6 +1199,151 @@ function closeModal() {
 }
 
 document.addEventListener('keydown', e => { if (e.key === 'Escape') closeModal(); });
+
+// --- Prompt ---
+let promptData = {};
+
+async function loadAllPrompts() {
+  try {
+    promptData = await apiCall('/api/prompts');
+    loadPrompt();
+  } catch (e) {
+    document.getElementById('prompt-editor').value = 'Error: ' + e.message;
+  }
+}
+
+function loadPrompt() {
+  const key = document.getElementById('prompt-select').value;
+  const info = promptData[key];
+  if (!info) return;
+  document.getElementById('prompt-editor').value = info.content;
+  document.getElementById('prompt-filename').textContent = info.filename;
+  document.getElementById('prompt-status').textContent = '';
+}
+
+async function savePrompt() {
+  const key = document.getElementById('prompt-select').value;
+  const content = document.getElementById('prompt-editor').value;
+  setLoading('prompt-save', true);
+  const statusEl = document.getElementById('prompt-status');
+  try {
+    const data = await apiCall('/api/prompts/save', {
+      method: 'POST',
+      body: JSON.stringify({ key, content }),
+    });
+    statusEl.textContent = `保存完了 (${data.size} bytes)`;
+    statusEl.className = 'text-sm ml-2 text-green-400';
+    promptData[key].content = content;
+  } catch (e) {
+    statusEl.textContent = 'エラー: ' + e.message;
+    statusEl.className = 'text-sm ml-2 text-red-400';
+  }
+  setLoading('prompt-save', false);
+}
+
+async function saveAndRestart() {
+  const key = document.getElementById('prompt-select').value;
+  const content = document.getElementById('prompt-editor').value;
+  setLoading('prompt-restart', true);
+  const statusEl = document.getElementById('prompt-status');
+  try {
+    await apiCall('/api/prompts/save', {
+      method: 'POST',
+      body: JSON.stringify({ key, content }),
+    });
+    promptData[key].content = content;
+    statusEl.textContent = '保存完了、LLM再起動中...';
+    statusEl.className = 'text-sm ml-2 text-yellow-400';
+    const restart = await apiCall('/api/prompts/restart', { method: 'POST' });
+    const svcStatus = Object.entries(restart.services).map(([k, v]) => `${k}: ${v}`).join(', ');
+    statusEl.textContent = `再起動完了 (${svcStatus})`;
+    statusEl.className = 'text-sm ml-2 text-green-400';
+  } catch (e) {
+    statusEl.textContent = 'エラー: ' + e.message;
+    statusEl.className = 'text-sm ml-2 text-red-400';
+  }
+  setLoading('prompt-restart', false);
+}
+
+async function loadBackups() {
+  const container = document.getElementById('prompt-backups');
+  try {
+    const data = await apiCall('/api/prompts/backups');
+    if (!data.backups.length) {
+      container.innerHTML = '<p class="text-sm text-gray-500">バックアップなし</p>';
+      return;
+    }
+    container.innerHTML = data.backups.map(b => {
+      const label = b.name.replace('_', ' ');
+      return `<div class="bg-gray-800 rounded px-4 py-2 flex items-center gap-3 text-sm">
+        <span class="font-mono">${label}</span>
+        <span class="text-gray-500">${b.files.length}ファイル</span>
+        <button onclick="restoreBackup('${b.name}')" class="ml-auto bg-kata-500 hover:bg-kata-600 text-black px-3 py-1 rounded text-xs font-medium transition">復元</button>
+        <button onclick="deleteBackup('${b.name}')" class="bg-red-600/80 hover:bg-red-700 text-white px-3 py-1 rounded text-xs transition">削除</button>
+      </div>`;
+    }).join('');
+  } catch (e) {
+    container.innerHTML = `<p class="text-sm text-red-400">${e.message}</p>`;
+  }
+}
+
+async function backupPrompts() {
+  setLoading('prompt-backup-btn', true);
+  try {
+    const data = await apiCall('/api/prompts/backup', { method: 'POST' });
+    document.getElementById('prompt-status').textContent = `バックアップ作成: ${data.name}`;
+    document.getElementById('prompt-status').className = 'text-sm ml-2 text-green-400';
+    await loadBackups();
+  } catch (e) {
+    document.getElementById('prompt-status').textContent = 'エラー: ' + e.message;
+    document.getElementById('prompt-status').className = 'text-sm ml-2 text-red-400';
+  }
+  setLoading('prompt-backup-btn', false);
+}
+
+async function restoreBackup(name) {
+  if (!confirm(`バックアップ「${name}」からプロンプトを復元しますか？\n現在のプロンプトは上書きされます。`)) return;
+  try {
+    await apiCall('/api/prompts/restore', {
+      method: 'POST',
+      body: JSON.stringify({ name }),
+    });
+    document.getElementById('prompt-status').textContent = `復元完了: ${name}`;
+    document.getElementById('prompt-status').className = 'text-sm ml-2 text-green-400';
+    await loadAllPrompts();
+  } catch (e) {
+    document.getElementById('prompt-status').textContent = 'エラー: ' + e.message;
+    document.getElementById('prompt-status').className = 'text-sm ml-2 text-red-400';
+  }
+}
+
+async function deleteBackup(name) {
+  if (!confirm(`バックアップ「${name}」を削除しますか？`)) return;
+  try {
+    await apiCall('/api/prompts/backup/delete', {
+      method: 'POST',
+      body: JSON.stringify({ name }),
+    });
+    await loadBackups();
+  } catch (e) {
+    alert('エラー: ' + e.message);
+  }
+}
+
+// Load data on first tab switch
+let diaryLoaded = false;
+const origSwitchTab = switchTab;
+switchTab = function(name) {
+  origSwitchTab(name);
+  if (name === 'prompt' && !Object.keys(promptData).length) {
+    loadAllPrompts();
+    loadBackups();
+  }
+  if (name === 'diary' && !diaryLoaded) {
+    diaryLoaded = true;
+    loadDiaryRecords();
+  }
+};
 
 // --- Status ---
 async function checkHealth() {
@@ -886,6 +1366,73 @@ async function checkHealth() {
   }
   setLoading('status-btn', false);
 }
+// --- Log Panel ---
+const LOG_MAX = 200;
+let logEntries = [];
+let logAutoScroll = true;
+let logOpen = true;
+
+function initLogPanel() {
+  document.body.classList.add('log-open');
+  const panel = document.getElementById('log-panel');
+  const content = document.getElementById('log-content');
+  content.addEventListener('scroll', () => {
+    const el = content;
+    logAutoScroll = (el.scrollHeight - el.scrollTop - el.clientHeight) < 30;
+  });
+}
+
+function toggleLogPanel() {
+  const panel = document.getElementById('log-panel');
+  logOpen = !logOpen;
+  panel.classList.toggle('collapsed', !logOpen);
+  document.body.classList.toggle('log-open', logOpen);
+  document.body.classList.toggle('log-closed', !logOpen);
+  document.getElementById('log-toggle-icon').textContent = logOpen ? '\u25B6' : '\u25C0';
+}
+
+function clearLog() {
+  logEntries = [];
+  document.getElementById('log-content').innerHTML = '';
+}
+
+function addLog(entry) {
+  logEntries.push(entry);
+  if (logEntries.length > LOG_MAX) logEntries.shift();
+  const content = document.getElementById('log-content');
+  const div = document.createElement('div');
+  div.className = 'log-entry';
+  div.innerHTML = entry;
+  content.appendChild(div);
+  if (content.children.length > LOG_MAX) content.removeChild(content.firstChild);
+  if (logAutoScroll) content.scrollTop = content.scrollHeight;
+}
+
+function logTime() {
+  return new Date().toLocaleTimeString('ja-JP', { hour12: false });
+}
+
+function truncBody(obj, max = 300) {
+  if (!obj) return '';
+  const s = typeof obj === 'string' ? obj : JSON.stringify(obj, null, 1);
+  return s.length > max ? s.slice(0, max) + '...' : s;
+}
+
+initLogPanel();
 </script>
+
+  <!-- Log Panel -->
+  <div id="log-panel">
+    <div class="flex items-center gap-2 px-2 py-1 border-b border-gray-700 bg-gray-800 flex-shrink-0">
+      <button onclick="toggleLogPanel()" class="text-gray-400 hover:text-white text-xs w-5" id="log-toggle-icon">&#9654;</button>
+      <span id="log-header-controls" class="flex items-center gap-2 flex-1 min-w-0">
+        <span class="text-xs font-medium text-gray-300">Log</span>
+        <span id="log-count" class="text-xs text-gray-500">0</span>
+        <button onclick="clearLog()" class="ml-auto text-xs text-gray-500 hover:text-gray-300">Clear</button>
+      </span>
+    </div>
+    <div id="log-content"></div>
+  </div>
+
 </body>
 </html>

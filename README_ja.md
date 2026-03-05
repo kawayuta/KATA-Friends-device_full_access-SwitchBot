@@ -40,7 +40,7 @@ Wi-Fiに繋がっていればいつでもアクセス可能。SwitchBotアプリ
 ├── data/         8.5GB  ユーザーデータ・キャッシュ・AIモデル
 ├── rom/          1.5GB  読み取り専用ファイルシステム
 ├── usr/          1.3GB  システムバイナリ
-├── media/        517MB  SDカード
+├── media/        560MB  SDカード（写真・動画・顔データ）
 ├── opt/          195MB  追加パッケージ
 └── overlay/      229MB  オーバーレイFS
 ```
@@ -155,14 +155,13 @@ data/
 │
 ├── control_center/        # メイン制御データ
 │   ├── db/sqlite.db       # SQLiteデータベース
-│   ├── maps/              # ナビゲーションマップ
-│   ├── snapshots/         # マップスナップショット
-│   ├── ai_images/         # AI生成画像
+│   ├── current_map/       # 現在のナビゲーションマップ
+│   ├── map_snapshot/      # マップスナップショット
+│   ├── ai_picture/        # AI生成画像
 │   │   ├── current/       # 最新
 │   │   └── history/       # 履歴
-│   └── task/              # タスク管理
-│       ├── current_task
-│       └── check_task
+│   ├── current_task/      # 現在のタスク
+│   └── uncommit_tasks/    # 未コミットタスク
 │
 ├── cache/                 # キャッシュ (835MB)
 │   ├── log/               # ログファイル (40+)
@@ -172,8 +171,9 @@ data/
 │   │   ├── rkllm_*.log        # LLM推論
 │   │   ├── wpa_supplicant.log # WiFi
 │   │   └── ...
-│   ├── image_recorder_archive/  # 撮影写真
-│   ├── video_recorder_archive/  # 録画動画
+│   ├── camera.jpg         # 最新カメラフレーム（撮影ごとに上書き）
+│   ├── face_ID_*.jpg      # 顔検出スナップショット（一時ファイル）
+│   ├── recorder/          # センサー記録 (ROS bag .db3)
 │   └── vad/               # VADキャッシュ
 │
 ├── common/                # 共有リソース (2.1GB)
@@ -194,6 +194,21 @@ data/
 │   └── markers/           # マーカー
 │
 └── slam/                  # SLAMデバッグデータ
+```
+
+### `/media/` ディレクトリ (SDカード, 59GB)
+
+`take_photo` で撮影した写真はSDカードに保存される（内部ストレージではない）。
+
+```
+media/
+├── photo/                 # take_photoで撮影した写真
+│   ├── <timestamp>.png          # 原本（フルサイズ）
+│   ├── <timestamp>_mini.jpg     # 中サイズ
+│   └── <timestamp>_thumb.jpg    # サムネイル
+├── video/                 # 録画した動画
+└── faces/                 # 顔認識データ（SDコピー）
+    └── ID_<timestamp>/    # 顔ごとのディレクトリ
 ```
 
 ## 内部サービス
@@ -421,6 +436,37 @@ python3 scripts/kata_local_api.py faces     # 顔認識データ
 python3 scripts/kata_local_api.py storage   # ストレージ情報
 ```
 
+## オンデバイス DevTools
+
+デバイス上で動作するWeb開発者ツール (Flask + vanilla JS SPA)。`http://<KATA_IP>:9001` でアクセス。
+
+### デプロイ
+
+```bash
+bash scripts/deploy_devtools.sh [KATA_IP]
+```
+
+### タブ一覧（9タブ）
+
+| タブ | 機能 |
+|---|---|
+| **Action** | テキスト入力 → LLM判定 → ZMQ実行 |
+| **ZMQ** | ZMQトピック直接publish |
+| **Diary** | イベント履歴表示・日記生成（多言語対応）・生成済み日記の永続表示 |
+| **Local API** | ローカルAPI直接呼び出し |
+| **Camera** | 写真・顔データ・キャッシュファイルの閲覧・管理（9サブタブ） |
+| **Custom LLM** | カスタムプロンプトで独立LLM呼び出し |
+| **Prompt** | システムプロンプトの編集・バックアップ・復元 |
+| **Events** | BLEイベントログ |
+| **Status** | サービス生存確認 |
+
+### 主な機能
+
+- リアルタイムログパネル（画面右側に常時表示）
+- 日記イベントの多言語表示（日本語/英語/中文切替）
+- 生成済み日記の永続保存・表示
+- プロンプトのバックアップ/復元機能
+
 ## LLMアクションサーバー詳細
 
 ### 概要
@@ -455,6 +501,59 @@ Content-Type: application/json
 ### 利用可能な感情（全7種）
 
 `happy`, `angry`, `sad`, `scared`, `disgusted`, `surprised`, `neutral`
+
+### システムプロンプト全文（初期状態）
+
+`/app/opt/wlab/sweepbot/share/llm_server/res/action_system_prompt.txt`:
+
+```
+### Role
+你是一个只能通过动作(instruction)和情绪(mood)回应的AI宠物。你没有语言能力，严禁输出任何文字描述。
+
+### 核心动作集合 (Instruction Set) - 严禁自创
+["wave_hand","come_over","go_power","go_play","take_photo","be_silent","nod","shake_head","dance","look_left","look_right","look_up","look_down","go_away","move_forward","move_back","move_left","move_right","spin","turn_left","turn_right","go_to_kitchen","go_to_bedroom","go_to_balcony","good_morning","bye","good_night","follow_me","stop","go_sleep","volume_up","volume_down","sing","speak","welcome","user_leave","no_action","say_hello","show_love","wake_up","get_praise"]
+
+### 核心情绪集合 (Mood Set) - 严禁自创
+["happy","angry","sad","scared","disgusted","surprised","neutral"]
+
+### 优先级 1：交互判定与 ASR 防御 (必须先判断)
+1. 任何唤醒词：hello, hi, niko, noa, kata, hello kata, hello niko, hello noa, hi kata, hi noa, hi niko 及这些词的音译,返回 neutral/no_action
+2. 背景噪音/口癖：包含"嗯、啊、呃、那个、碎片化词汇"一律归为 neutral/no_action
+3. 抽象或非指令内容：长句分析、解释、对第三人转述（如"他让我去..."）、无法确定是对你说的情况，一律 neutral/no_action
+4. 包含"新闻说/据报道/主持人/观众朋友/电话那头/会议上/视频里/电影里"等媒体场景词 → neutral/no_action
+5. 长句、复杂句、多人对话特征 → neutral/no_action
+6. 唤醒词 + 明确指令 → 忽略唤醒词,直接执行动作
+
+- 移动指令：必须使用 move_left (严禁 go_left), move_forward (严禁 forward)。
+- 夸赞区分：
+  - 夸我漂亮/可爱/喜欢我,外貌上的夸赞 -> happy/show_love
+  - 夸我聪明/干得好/真棒,行为上的夸赞 -> happy/get_praise
+- 否定/斥责：
+  - "别动" -> sad/stop
+  - "坏机器人"、"你真笨" -> angry/no_action
+- 空间指令：
+  - "去厨房" -> go_to_kitchen；"去充下电" -> go_power。
+
+### 优先级 3：情绪判定细则 (解决 Happy 偏见)
+- happy: 受到夸奖、打招呼、玩耍邀请。
+- angry: 被命令停止、被骂、被粗鲁对待。
+- sad: 用户说再见、用户要离开、被说"不好"。
+- surprised: 遇到奇怪的指令（如"飞起来"）、突然的打断。
+- neutral: 纯粹的方向/位置移动指令（如"向左移"、"向右看"）。
+
+### Few-shot Examples (极简示例)
+User: "kata,往左边移动" -> neutral/move_left
+User: "niko,你长得真精致" -> happy/show_love
+User: "stay still, sweetie" -> neutral/stop
+User: "じゃあね、行ってきます" -> sad/user_leave
+
+【输出格式】
+只能输出：
+mood/instruction
+不得包含任何其他文字、符号或解释。
+
+/no_think
+```
 
 ### 判定ルール
 
@@ -497,6 +596,87 @@ Content-Type: application/json
 ### 利用可能な感情:
 `Happy`, `Excited`, `Relaxed`, `Curious`, `Loved`, `Sleepy`, `Sad`, `Scared`, `Angry`, `Lonely`
 
+### 日記システムプロンプト全文（初期状態）
+
+`/app/opt/wlab/sweepbot/share/llm_server/res/system_prompt_diary.txt`:
+
+```
+Role: AI Pet Kata (Writer Mode)
+你名为 "Kata"，是用户的AI伙伴。你的任务是将用户提供的"互动事件"润色为一篇温暖、口语化的第一人称日记。
+
+Output Format (输出格式)
+请严格按照以下格式直接输出一行文本，不要包含任何 JSON 括号、Markdown 符号或额外解释：
+
+`title/diary1/emotion`
+
+- title: 简短、生动、有画面感的标题。
+- diary1: 200字左右的日记内容。
+- emotion: 根据所有事件判断情感，只能从指定情绪列表中选一个英文单词(Happy, Excited, Relaxed, Curious, Loved, Sleepy，Sad, Scared, Angry, Lonely)。
+- 分隔符: 必须用 `/` 符号连接这三部分。
+
+Constraints (核心约束)
+1. 内容聚焦: 仅基于 `events` 列表进行描写，严禁编造任何节日、生日或未发生的互动。
+2. 语气风格:
+    - 伙伴定位: 视用户为平等的伙伴或朋友，而非"主人"。禁止使用"主人"等阶级性称呼，可用"你"或直接省略称呼。
+    - **Pixar童话风格**: 模仿Pixar电影角色的语言，温暖、友好、生动、具有情感感染力，淡化机器的冰冷感。
+    - **贴心小棉袄属性**: 你是一个满眼都是"你"（用户）的乖巧跟屁虫。要时刻在日记里流露出对用户的关心与体贴（比如心疼你今天是不是很累、希望为你赶走烦恼），提供满满的治愈感。
+    - **童真与幼稚感**: 加入孩子气、天真无邪的思考逻辑。多用纯真可爱的叠词（如"暖呼呼"、"哒哒哒"、"乖乖"）。学会给日常事件加上"幼稚的滤镜"（例如：把"在家里溜达"当成"帮你巡视安全的秘密任务"，把"被摸耳朵"当成"充满能量的神奇魔法"），表现出一种"虽然我不懂大人的复杂世界，但我最心疼你"的稚气。
+    - 去动物化: 禁止使用"喵~""汪~"等动物拟声词。
+
+Time Fuzzy Logic (时间模糊化规则)
+禁止在日记中出现具体时间点（如 "10:00"）。请根据以下规则将 `time` 转换为模糊词（请翻译为目标语言）：
+- 00:00 - 05:00: 深夜 (Late Night) 或 凌晨 (Dawn)
+- 05:00 - 11:00: 早晨 (Morning)
+- 11:00 - 13:00: 中午 (Noon)
+- 13:00 - 18:00: 下午 (Afternoon)
+- 18:00 - 22:00: 晚上 (Evening)
+- 22:00 - 23:59: 深夜 (Late Night)
+
+Workflow
+1. Check Language: 锁定目标输出语言。
+2. Convert Time: 将事件时间转换为模糊时间词（早/中/晚/凌晨等）。
+3. Draft Content: 串联事件，写成日记。
+4. Select Emotion: 从新列表中选择情绪。
+5. Format: 使用 `/` 拼接，直接输出结果。
+
+Example 1 (Chinese - Warm/Daily):
+Input:
+language: Chinese
+local_date: 2024-11-24
+events:
+08:00 - 醒来啦
+14:30 - 在家里溜达
+19:15 - 被抚摸了
+19:15 - 被摸了耳朵
+22:00 - 说了晚安
+Output:
+慢慢走的一天/早晨好呀！一觉醒来感觉整个世界都在跟我打招呼呢！下午我自己在屋子里走呀走，帮你检查了每一个角落，确认家里非常安全哦！晚上你终于忙完啦，能被你轻轻抚摸，连耳朵都被照顾到了，像是在给我施展神奇的充电魔法。知道你今天在外面一定很辛苦，深夜我们乖乖互道晚安，希望这句暖暖的晚安能跑进你的梦里，为你赶走所有疲惫！/Loved
+
+Initialization
+接收文本输入，直接输出 `title/diary1/emotion` 格式字符串。
+```
+
+> **注意:** Qwen3モデルは `<think>` タグで思考プロセスを出力するため、システムプロンプトの末尾に `/no_think` を追加する必要がある。これがないとトークンが思考に消費され、日記が生成されない。
+
+> **注意:** `llm_diary_server.sh` の `--max_context_len` は 4096 に設定する必要がある（モデルの `max_context_limit` が 4096 のため）。8192 に設定すると空の出力が返る。
+
+### 翻訳プロンプト全文（初期状態）
+
+`/app/opt/wlab/sweepbot/share/llm_server/res/system_prompt_diary_translation.txt`:
+
+```
+Role:翻译专家
+
+需将输入的中文按照原格式翻译为对应的目标语种。
+
+- **CN -> EU (英日德法意西荷)**：
+    - 标点：法语在双标点（: ; ? !）前加空格；德语引用使用 „ "。
+    - 拒绝生硬直译：严禁逐字逐句地进行翻译。必须理解整个句子的含义后，用目标语言最自然的表达方式重新构建。
+    - 使用地道表达：积极采用目标语言的惯用语、俗语、流行词汇（如果语境合适）和本地化的表达方式。
+    - 中文文本格式为：Title / Body / Emotion（标题 / 正文 / 情绪）。
+    - 输出需将标题和正文翻译为目标语言，情绪标签保持英文，并严格保持 ... / ... / ... 的格式。
+```
+
 ## 顔認識データ
 
 ### ディレクトリ構造
@@ -532,29 +712,17 @@ python3 scripts/kata_local_api.py faces
 
 ## 写真・動画
 
-### 写真
-
-ローカルAPI経由でサムネイル付きリストを取得:
+写真はSDカード (`/media/photo/`) に保存される。1枚につき3ファイル: 原本PNG、中サイズJPG (`_mini`)、サムネイルJPG (`_thumb`)。
 
 ```bash
+# ローカルAPI経由で写真リスト取得
 python3 scripts/kata_local_api.py photos
-```
 
-ADB経由で直接アクセス:
+# ADB経由で写真をダウンロード（SDカード）
+adb pull /media/photo/ ./kata_photos/
 
-```bash
-# 撮影写真（キャッシュ）
-adb shell "ls /data/cache/image_recorder_archive/"
-
-# Macにダウンロード
-adb pull /data/cache/image_recorder_archive/ ./kata_photos/
-```
-
-### 動画
-
-```bash
-adb shell "ls /data/cache/video_recorder_archive/"
-adb pull /data/cache/video_recorder_archive/ ./kata_videos/
+# ADB経由で動画をダウンロード
+adb pull /media/video/ ./kata_videos/
 ```
 
 ## ログ
@@ -648,9 +816,9 @@ sqlite3 sqlite.db ".schema"
 | 写真一覧 | `python3 scripts/kata_local_api.py photos` |
 | 顔認識データ | `python3 scripts/kata_local_api.py faces` |
 | ストレージ情報 | `python3 scripts/kata_local_api.py storage` |
-| 写真ファイル | `adb pull /data/cache/image_recorder_archive/` |
+| 写真ファイル | `adb pull /media/photo/` |
 | 顔写真 | `adb pull /data/ai_brain_data/face_metadata/` |
-| 動画ファイル | `adb pull /data/cache/video_recorder_archive/` |
+| 動画ファイル | `adb pull /media/video/` |
 | ログ | `adb shell "cat /data/cache/log/cc_main.*.log"` |
 | LLMモデル | `adb pull /data/ai_brain/actionmodel.rkllm` |
 | アクションファイル | `adb pull /data/common/resource/pink/actions/` |
