@@ -1,0 +1,377 @@
+<!DOCTYPE html>
+<html lang="ja" class="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Kata Friends DevTools</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: {
+        extend: {
+          colors: {
+            kata: { 500: '#f59e0b', 600: '#d97706' }
+          }
+        }
+      }
+    }
+  </script>
+  <style>
+    .tab-active { border-color: #f59e0b; color: #f59e0b; }
+    pre.json { white-space: pre-wrap; word-break: break-all; }
+    .status-up { color: #34d399; }
+    .status-down { color: #f87171; }
+    .spinner { animation: spin 1s linear infinite; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+  </style>
+</head>
+<body class="bg-gray-900 text-gray-100 min-h-screen">
+  <div class="max-w-4xl mx-auto px-4 py-6">
+    <!-- Header -->
+    <h1 class="text-2xl font-bold text-kata-500 mb-4">Kata Friends DevTools</h1>
+
+    <!-- Tabs -->
+    <div class="flex border-b border-gray-700 mb-6 gap-1">
+      <button onclick="switchTab('action')" id="tab-action" class="px-4 py-2 border-b-2 border-transparent hover:text-kata-500 transition tab-active">Action</button>
+      <button onclick="switchTab('zmq')" id="tab-zmq" class="px-4 py-2 border-b-2 border-transparent hover:text-kata-500 transition">ZMQ</button>
+      <button onclick="switchTab('diary')" id="tab-diary" class="px-4 py-2 border-b-2 border-transparent hover:text-kata-500 transition">Diary</button>
+      <button onclick="switchTab('local')" id="tab-local" class="px-4 py-2 border-b-2 border-transparent hover:text-kata-500 transition">Local API</button>
+      <button onclick="switchTab('events')" id="tab-events" class="px-4 py-2 border-b-2 border-transparent hover:text-kata-500 transition">Events</button>
+      <button onclick="switchTab('status')" id="tab-status" class="px-4 py-2 border-b-2 border-transparent hover:text-kata-500 transition">Status</button>
+    </div>
+
+    <!-- Action Tab -->
+    <div id="panel-action" class="tab-panel">
+      <div class="mb-4">
+        <label class="block text-sm text-gray-400 mb-1">テキスト入力</label>
+        <div class="flex gap-2">
+          <input id="action-input" type="text" placeholder="例: 踊って" class="flex-1 bg-gray-800 border border-gray-600 rounded px-3 py-2 focus:outline-none focus:border-kata-500">
+          <button onclick="sendAction()" id="action-send" class="bg-kata-500 hover:bg-kata-600 text-black font-medium px-4 py-2 rounded transition">判定のみ</button>
+          <button onclick="executeAction()" id="action-exec" class="bg-green-600 hover:bg-green-700 text-white font-medium px-4 py-2 rounded transition">実行</button>
+        </div>
+      </div>
+      <div class="mb-4">
+        <label class="block text-sm text-gray-400 mb-2">プリセット (クリックで実行)</label>
+        <div class="flex flex-wrap gap-2">
+          <button onclick="executeAction('踊って')" class="bg-gray-700 hover:bg-gray-600 px-3 py-1 rounded text-sm transition">踊って</button>
+          <button onclick="executeAction('写真撮って')" class="bg-gray-700 hover:bg-gray-600 px-3 py-1 rounded text-sm transition">写真撮って</button>
+          <button onclick="executeAction('こっち来て')" class="bg-gray-700 hover:bg-gray-600 px-3 py-1 rounded text-sm transition">こっち来て</button>
+          <button onclick="executeAction('おすわり')" class="bg-gray-700 hover:bg-gray-600 px-3 py-1 rounded text-sm transition">おすわり</button>
+          <button onclick="executeAction('お手')" class="bg-gray-700 hover:bg-gray-600 px-3 py-1 rounded text-sm transition">お手</button>
+          <button onclick="executeAction('ハイタッチ')" class="bg-gray-700 hover:bg-gray-600 px-3 py-1 rounded text-sm transition">ハイタッチ</button>
+        </div>
+      </div>
+      <p class="text-xs text-gray-500 mb-3">「判定のみ」= LLMのmood/instruction応答を確認。「実行」= LLM判定 → ZMQ publish でデバイスを動かす。</p>
+      <div id="action-result" class="bg-gray-800 rounded p-4 min-h-[100px] hidden">
+        <pre class="json text-sm"></pre>
+      </div>
+    </div>
+
+    <!-- ZMQ Tab -->
+    <div id="panel-zmq" class="tab-panel hidden">
+      <div class="mb-4">
+        <label class="block text-sm text-gray-400 mb-1">トピック</label>
+        <select id="zmq-topic" class="bg-gray-800 border border-gray-600 rounded px-3 py-2">
+          <option value="/agent/start_cc_task">/agent/start_cc_task</option>
+          <option value="/agent/stop_cc_task">/agent/stop_cc_task</option>
+          <option value="/ai/do_action">/ai/do_action</option>
+          <option value="/ai/mood">/ai/mood</option>
+          <option value="/ai/sound">/ai/sound</option>
+          <option value="/ai/show_eyes">/ai/show_eyes</option>
+        </select>
+      </div>
+      <div class="mb-4">
+        <label class="block text-sm text-gray-400 mb-1">Payload (JSON)</label>
+        <textarea id="zmq-payload" rows="4" placeholder='{"action":"RDANCE008","task_name":"dance","task_type":"voice"}' class="w-full bg-gray-800 border border-gray-600 rounded px-3 py-2 font-mono text-sm focus:outline-none focus:border-kata-500"></textarea>
+      </div>
+      <button onclick="zmqPublish()" id="zmq-send" class="bg-red-600 hover:bg-red-700 text-white font-medium px-4 py-2 rounded transition mb-4">Publish</button>
+      <p class="text-xs text-gray-500 mb-3">デバイス内部のZMQバス(:5558)にctypes+libzmq.so.5で直接publishします。</p>
+      <div id="zmq-result" class="bg-gray-800 rounded p-4 min-h-[100px] hidden">
+        <pre class="json text-sm"></pre>
+      </div>
+    </div>
+
+    <!-- Diary Tab -->
+    <div id="panel-diary" class="tab-panel hidden">
+      <div class="mb-4">
+        <label class="block text-sm text-gray-400 mb-1">イベントリスト (1行ずつ)</label>
+        <textarea id="diary-events" rows="5" placeholder="散歩に行った&#10;ご飯を食べた&#10;撫でてもらった" class="w-full bg-gray-800 border border-gray-600 rounded px-3 py-2 focus:outline-none focus:border-kata-500"></textarea>
+      </div>
+      <div class="flex gap-2 mb-4">
+        <select id="diary-lang" class="bg-gray-800 border border-gray-600 rounded px-3 py-2">
+          <option value="ja">日本語</option>
+          <option value="en">English</option>
+          <option value="zh">中文</option>
+        </select>
+        <button onclick="generateDiary()" id="diary-send" class="bg-kata-500 hover:bg-kata-600 text-black font-medium px-4 py-2 rounded transition">日記生成</button>
+      </div>
+      <div id="diary-result" class="bg-gray-800 rounded p-4 min-h-[100px] hidden">
+        <pre class="json text-sm"></pre>
+      </div>
+    </div>
+
+    <!-- Local API Tab -->
+    <div id="panel-local" class="tab-panel hidden">
+      <div class="mb-4 flex gap-2 items-end">
+        <div>
+          <label class="block text-sm text-gray-400 mb-1">Function ID</label>
+          <select id="local-func" class="bg-gray-800 border border-gray-600 rounded px-3 py-2">
+            <option value="9206">9206 - Storage</option>
+            <option value="9217">9217 - Photos</option>
+            <option value="9225">9225 - Faces</option>
+          </select>
+        </div>
+        <div>
+          <label class="block text-sm text-gray-400 mb-1">または直接入力</label>
+          <input id="local-raw-id" type="number" placeholder="functionID" class="bg-gray-800 border border-gray-600 rounded px-3 py-2 w-32">
+        </div>
+        <button onclick="callLocalAPI()" id="local-send" class="bg-kata-500 hover:bg-kata-600 text-black font-medium px-4 py-2 rounded transition">実行</button>
+      </div>
+      <div class="mb-4">
+        <label class="block text-sm text-gray-400 mb-1">Params (JSON, 省略可)</label>
+        <textarea id="local-params" rows="3" placeholder='{"0": {}}' class="w-full bg-gray-800 border border-gray-600 rounded px-3 py-2 font-mono text-sm focus:outline-none focus:border-kata-500"></textarea>
+      </div>
+      <div id="local-result" class="bg-gray-800 rounded p-4 min-h-[100px] hidden">
+        <pre class="json text-sm"></pre>
+      </div>
+    </div>
+
+    <!-- Events Tab -->
+    <div id="panel-events" class="tab-panel hidden">
+      <div class="flex items-center gap-2 mb-4">
+        <button onclick="loadEvents()" class="bg-kata-500 hover:bg-kata-600 text-black font-medium px-4 py-2 rounded transition">更新</button>
+        <label class="text-sm text-gray-400">
+          <input type="checkbox" id="events-auto" class="mr-1" onchange="toggleAutoRefresh()"> 自動更新 (5s)
+        </label>
+        <span id="events-count" class="text-sm text-gray-500 ml-auto"></span>
+      </div>
+      <div id="events-list" class="space-y-2"></div>
+    </div>
+
+    <!-- Status Tab -->
+    <div id="panel-status" class="tab-panel hidden">
+      <button onclick="checkHealth()" id="status-btn" class="bg-kata-500 hover:bg-kata-600 text-black font-medium px-4 py-2 rounded transition mb-4">チェック</button>
+      <div id="status-result" class="space-y-2"></div>
+    </div>
+  </div>
+
+<script>
+// --- Tab switching ---
+const tabs = ['action', 'zmq', 'diary', 'local', 'events', 'status'];
+function switchTab(name) {
+  tabs.forEach(t => {
+    document.getElementById(`panel-${t}`).classList.toggle('hidden', t !== name);
+    document.getElementById(`tab-${t}`).classList.toggle('tab-active', t === name);
+    if (t !== name) document.getElementById(`tab-${t}`).classList.add('border-transparent');
+    else document.getElementById(`tab-${t}`).classList.remove('border-transparent');
+  });
+}
+
+// --- Helpers ---
+function showResult(id, data) {
+  const el = document.getElementById(id);
+  el.classList.remove('hidden');
+  el.querySelector('pre').textContent = JSON.stringify(data, null, 2);
+}
+
+function setLoading(btnId, loading) {
+  const btn = document.getElementById(btnId);
+  if (loading) {
+    btn.disabled = true;
+    btn.dataset.origText = btn.textContent;
+    btn.textContent = '...';
+    btn.classList.add('opacity-50');
+  } else {
+    btn.disabled = false;
+    btn.textContent = btn.dataset.origText || btn.textContent;
+    btn.classList.remove('opacity-50');
+  }
+}
+
+async function apiCall(url, options = {}) {
+  const resp = await fetch(url, {
+    headers: { 'Content-Type': 'application/json' },
+    ...options,
+  });
+  return resp.json();
+}
+
+// --- Action ---
+async function sendAction(preset) {
+  const text = preset || document.getElementById('action-input').value.trim();
+  if (!text) return;
+  if (!preset) document.getElementById('action-input').value = text;
+  setLoading('action-send', true);
+  try {
+    const data = await apiCall('/api/action', {
+      method: 'POST',
+      body: JSON.stringify({ voiceText: text }),
+    });
+    showResult('action-result', data);
+  } catch (e) {
+    showResult('action-result', { error: e.message });
+  }
+  setLoading('action-send', false);
+}
+
+document.getElementById('action-input').addEventListener('keydown', e => {
+  if (e.key === 'Enter') executeAction();
+});
+
+// --- Execute (LLM → ZMQ) ---
+async function executeAction(preset) {
+  const text = preset || document.getElementById('action-input').value.trim();
+  if (!text) return;
+  setLoading('action-exec', true);
+  try {
+    const data = await apiCall('/api/execute', {
+      method: 'POST',
+      body: JSON.stringify({ voiceText: text }),
+    });
+    showResult('action-result', data);
+  } catch (e) {
+    showResult('action-result', { error: e.message });
+  }
+  setLoading('action-exec', false);
+}
+
+// --- ZMQ Publish ---
+async function zmqPublish() {
+  const topic = document.getElementById('zmq-topic').value;
+  const payloadStr = document.getElementById('zmq-payload').value.trim();
+  if (!payloadStr) return;
+  let payload;
+  try {
+    payload = JSON.parse(payloadStr);
+  } catch {
+    showResult('zmq-result', { error: 'Invalid JSON' });
+    return;
+  }
+  setLoading('zmq-send', true);
+  try {
+    const data = await apiCall('/api/zmq/publish', {
+      method: 'POST',
+      body: JSON.stringify({ topic, payload }),
+    });
+    showResult('zmq-result', data);
+  } catch (e) {
+    showResult('zmq-result', { error: e.message });
+  }
+  setLoading('zmq-send', false);
+}
+
+// --- Diary ---
+async function generateDiary() {
+  const raw = document.getElementById('diary-events').value.trim();
+  if (!raw) return;
+  const events = raw.split('\n').filter(l => l.trim());
+  const language = document.getElementById('diary-lang').value;
+  setLoading('diary-send', true);
+  try {
+    const data = await apiCall('/api/diary', {
+      method: 'POST',
+      body: JSON.stringify({ events, language, local_date: new Date().toISOString().slice(0, 10) }),
+    });
+    showResult('diary-result', data);
+  } catch (e) {
+    showResult('diary-result', { error: e.message });
+  }
+  setLoading('diary-send', false);
+}
+
+// --- Local API ---
+async function callLocalAPI() {
+  const rawId = document.getElementById('local-raw-id').value;
+  const selectId = document.getElementById('local-func').value;
+  const functionId = parseInt(rawId || selectId);
+  const paramsStr = document.getElementById('local-params').value.trim();
+
+  let params = null;
+  if (paramsStr) {
+    try {
+      params = JSON.parse(paramsStr);
+    } catch {
+      showResult('local-result', { error: 'Invalid JSON in params' });
+      return;
+    }
+  }
+
+  setLoading('local-send', true);
+  try {
+    const body = { function_id: functionId };
+    if (params) body.params = params;
+    const data = await apiCall('/api/local', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    });
+    showResult('local-result', data);
+  } catch (e) {
+    showResult('local-result', { error: e.message });
+  }
+  setLoading('local-send', false);
+}
+
+// --- Events ---
+let eventsTimer = null;
+
+async function loadEvents() {
+  try {
+    const data = await apiCall('/api/events?n=50');
+    const countEl = document.getElementById('events-count');
+    countEl.textContent = `${data.events.length} / ${data.total} 件`;
+
+    const list = document.getElementById('events-list');
+    if (!data.events.length) {
+      list.innerHTML = '<p class="text-gray-500">イベントなし</p>';
+      return;
+    }
+    list.innerHTML = data.events.map(ev => {
+      const time = ev.received_at ? ev.received_at.split('T')[1]?.substring(0, 8) : '??';
+      const type = ev.type || 'unknown';
+      const badge = type === 'action' ? 'bg-blue-800' : type === 'interaction_start' ? 'bg-green-800' : 'bg-gray-700';
+      return `<div class="bg-gray-800 rounded p-3 text-sm">
+        <span class="text-gray-400">${time}</span>
+        <span class="${badge} px-2 py-0.5 rounded text-xs ml-2">${type}</span>
+        <pre class="json text-xs text-gray-300 mt-1">${JSON.stringify(ev.data || {}, null, 2)}</pre>
+      </div>`;
+    }).join('');
+  } catch (e) {
+    document.getElementById('events-list').innerHTML = `<p class="text-red-400">${e.message}</p>`;
+  }
+}
+
+function toggleAutoRefresh() {
+  if (document.getElementById('events-auto').checked) {
+    loadEvents();
+    eventsTimer = setInterval(loadEvents, 5000);
+  } else {
+    clearInterval(eventsTimer);
+    eventsTimer = null;
+  }
+}
+
+// --- Status ---
+async function checkHealth() {
+  setLoading('status-btn', true);
+  try {
+    const data = await apiCall('/api/health');
+    const el = document.getElementById('status-result');
+    el.innerHTML = `<p class="text-sm text-gray-400 mb-2">IP: ${data.ip}</p>` +
+      Object.entries(data.services).map(([name, info]) => {
+        const up = info.status.startsWith('up');
+        return `<div class="flex items-center gap-3 bg-gray-800 rounded px-4 py-2">
+          <span class="${up ? 'status-up' : 'status-down'} text-lg">${up ? '\u25CF' : '\u25CB'}</span>
+          <span class="w-36">${name}</span>
+          <span class="text-gray-400">:${info.port}</span>
+          <span class="text-sm ${up ? 'text-green-400' : 'text-red-400'} ml-auto">${info.status}${info.code ? ` (${info.code})` : ''}</span>
+        </div>`;
+      }).join('');
+  } catch (e) {
+    document.getElementById('status-result').innerHTML = `<p class="text-red-400">${e.message}</p>`;
+  }
+  setLoading('status-btn', false);
+}
+</script>
+</body>
+</html>

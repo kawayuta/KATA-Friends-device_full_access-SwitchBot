@@ -1,0 +1,8 @@
+services:
+  devtools:
+    build: .
+    ports:
+      - "9001:9001"
+    env_file:
+      - ../.env
+    restart: unless-stopped
