@@ -290,6 +290,69 @@ def zmq_publish():
 
 CUSTOM_PROMPT_PATH = "/data/devtools/custom_prompt.txt"
 CUSTOM_LLM_CONFIG_PATH = "/data/devtools/custom_llm_config.json"
+LLM_BACKEND_CONFIG_PATH = "/data/devtools/llm_backend_config.json"
+
+_LLM_BACKEND_DEFAULTS = {
+    "backend": "device",
+    "lmstudio_url": "http://192.168.11.xx:1234/v1",
+    "lmstudio_model": "",
+}
+
+
+def _load_llm_backend_config():
+    if os.path.isfile(LLM_BACKEND_CONFIG_PATH):
+        try:
+            with open(LLM_BACKEND_CONFIG_PATH, "r", encoding="utf-8") as f:
+                cfg = json.loads(f.read())
+            merged = dict(_LLM_BACKEND_DEFAULTS)
+            merged.update(cfg)
+            return merged
+        except Exception:
+            pass
+    return dict(_LLM_BACKEND_DEFAULTS)
+
+
+@app.get("/api/llm-backend")
+def get_llm_backend():
+    return jsonify(_load_llm_backend_config())
+
+
+@app.post("/api/llm-backend")
+def set_llm_backend():
+    data = request.get_json(force=True)
+    cfg = _load_llm_backend_config()
+    for key in ("backend", "lmstudio_url", "lmstudio_model"):
+        if key in data:
+            cfg[key] = data[key]
+    # Normalize URL: ensure /v1 suffix
+    ext_url = cfg.get("lmstudio_url", "").rstrip("/")
+    if ext_url and not ext_url.endswith("/v1"):
+        cfg["lmstudio_url"] = ext_url + "/v1"
+    os.makedirs(os.path.dirname(LLM_BACKEND_CONFIG_PATH), exist_ok=True)
+    with open(LLM_BACKEND_CONFIG_PATH, "w", encoding="utf-8") as f:
+        f.write(json.dumps(cfg, ensure_ascii=False, indent=2))
+    return jsonify(cfg)
+
+
+@app.post("/api/llm-backend/test")
+def test_llm_backend():
+    """Proxy connection test to LM Studio /models endpoint."""
+    data = request.get_json(force=True)
+    url = (data.get("url") or "").strip().rstrip("/")
+    if not url:
+        return flask_error(400, "url is required")
+    if not url.endswith("/v1"):
+        url += "/v1"
+    try:
+        resp = requests.get(f"{url}/models", timeout=10)
+        resp.raise_for_status()
+        return jsonify(resp.json())
+    except requests.ConnectionError:
+        return flask_error(502, f"接続失敗: {url}")
+    except requests.Timeout:
+        return flask_error(504, "タイムアウト")
+    except Exception as e:
+        return flask_error(502, str(e))
 
 
 @app.post("/api/execute")
@@ -341,6 +404,29 @@ def execute_action():
     return jsonify(result)
 
 
+def _lmstudio_chat(ext_url, model, messages, config):
+    """Send chat request to LM Studio (OpenAI compatible)."""
+    payload = {
+        "model": model,
+        "messages": messages,
+        "temperature": float(config.get("temperature", 1.3)),
+        "max_tokens": int(config.get("max_new_tokens", 4096)),
+        "think": False,
+        "reasoning_effort": "none",
+    }
+    resp = requests.post(
+        f"{ext_url}/chat/completions",
+        json=payload,
+        timeout=300,
+    )
+    resp.raise_for_status()
+    result_text = resp.json()["choices"][0]["message"].get("content", "").strip()
+    result_text = re.sub(r"<think>.*?</think>", "", result_text, flags=re.DOTALL).strip()
+    # Strip special tokens
+    result_text = re.sub(r"<\|[^>]*\|>", "", result_text).strip()
+    return result_text
+
+
 @app.post("/api/custom-llm")
 def custom_llm_call():
     """Call diary LLM with custom prompt template. Supports VLM with image."""
@@ -378,7 +464,11 @@ def custom_llm_call():
         except Exception:
             pass
 
-    # VLM mode: capture camera image and call VLM endpoint
+    # Load LLM backend config
+    backend_cfg = _load_llm_backend_config()
+    use_lmstudio = backend_cfg.get("backend") == "lmstudio"
+
+    # VLM mode: capture camera image
     if use_camera:
         try:
             # Capture camera snapshot
@@ -405,34 +495,81 @@ def custom_llm_call():
         except Exception as e:
             return flask_error(500, f"camera capture error: {e}")
 
-        # Call VLM endpoint
-        try:
-            resp = requests.post(
-                "http://127.0.0.1:8082/rkllm_vlm",
-                json={
+        if use_lmstudio:
+            try:
+                ext_url = backend_cfg["lmstudio_url"].rstrip("/")
+                messages = [
+                    {"role": "system", "content": filled},
+                    {"role": "user", "content": [
+                        {"type": "text", "text": text},
+                        {"type": "image_url", "image_url": {
+                            "url": f"data:image/jpeg;base64,{image_b64}"
+                        }},
+                    ]},
+                ]
+                result_text = _lmstudio_chat(ext_url, backend_cfg.get("lmstudio_model", ""), messages, config)
+                return jsonify({
+                    "result": result_text,
                     "prompt": filled,
-                    "image_base64": image_b64,
-                    "max_new_tokens": int(config.get("max_new_tokens", 512)),
-                },
-                timeout=300,
-            )
-            if resp.status_code == 503:
-                return flask_error(503, "VLM server busy")
-            result_text = resp.text.strip()
-            result_text = re.sub(
-                r"<think>.*?</think>", "", result_text, flags=re.DOTALL
-            ).strip()
+                    "mode": "vlm",
+                    "backend": "lmstudio",
+                })
+            except requests.ConnectionError:
+                return flask_error(502, "LM Studio unreachable")
+            except requests.Timeout:
+                return flask_error(504, "LM Studio timeout")
+            except Exception as e:
+                return flask_error(502, f"LM Studio error: {e}")
+        else:
+            # Device RKLLM VLM endpoint
+            try:
+                resp = requests.post(
+                    "http://127.0.0.1:8082/rkllm_vlm",
+                    json={
+                        "prompt": filled,
+                        "image_base64": image_b64,
+                        "max_new_tokens": int(config.get("max_new_tokens", 512)),
+                    },
+                    timeout=300,
+                )
+                if resp.status_code == 503:
+                    return flask_error(503, "VLM server busy")
+                result_text = resp.text.strip()
+                result_text = re.sub(
+                    r"<think>.*?</think>", "", result_text, flags=re.DOTALL
+                ).strip()
+                return jsonify({
+                    "result": result_text,
+                    "prompt": filled,
+                    "mode": "vlm",
+                })
+            except requests.ConnectionError:
+                return flask_error(502, "VLM server (8082) unreachable")
+            except requests.Timeout:
+                return flask_error(504, "VLM timeout")
+
+    # Text-only mode
+    if use_lmstudio:
+        try:
+            ext_url = backend_cfg["lmstudio_url"].rstrip("/")
+            messages = [
+                {"role": "system", "content": filled},
+                {"role": "user", "content": text},
+            ]
+            result_text = _lmstudio_chat(ext_url, backend_cfg.get("lmstudio_model", ""), messages, config)
             return jsonify({
                 "result": result_text,
                 "prompt": filled,
-                "mode": "vlm",
+                "backend": "lmstudio",
             })
         except requests.ConnectionError:
-            return flask_error(502, "VLM server (8082) unreachable")
+            return flask_error(502, "LM Studio unreachable")
         except requests.Timeout:
-            return flask_error(504, "VLM timeout")
+            return flask_error(504, "LM Studio timeout")
+        except Exception as e:
+            return flask_error(502, f"LM Studio error: {e}")
 
-    # Text-only mode: call diary server
+    # Device RKLLM text mode
     payload = {
         "task": config.get("task", "custom"),
         "prompt": filled,
@@ -1560,6 +1697,32 @@ def tts_synthesize():
         ["mpg123", "-q", mp3_path],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
+    return jsonify({"status": "ok"})
+
+
+# --- Auto-talk config ---
+
+AUTO_TALK_CONFIG_PATH = "/data/devtools/auto_talk_config.json"
+
+
+@app.get("/api/auto-talk/config")
+def auto_talk_config_get():
+    try:
+        with open(AUTO_TALK_CONFIG_PATH, "r") as f:
+            return jsonify(json.load(f))
+    except Exception:
+        return jsonify({"text": "今何が見える？", "interval": 60})
+
+
+@app.post("/api/auto-talk/config")
+def auto_talk_config_save():
+    data = request.get_json(force=True)
+    cfg = {
+        "text": data.get("text", "今何が見える？"),
+        "interval": int(data.get("interval", 60)),
+    }
+    with open(AUTO_TALK_CONFIG_PATH, "w") as f:
+        json.dump(cfg, f, ensure_ascii=False, indent=2)
     return jsonify({"status": "ok"})
 
 
