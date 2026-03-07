@@ -2076,11 +2076,11 @@ def _zmq_recv_multipart(zmq_lib, socket):
     return frames
 
 
-def _zmq_flush(zmq_lib, socket, duration=3.0):
+def _zmq_flush(zmq_lib, socket, duration=1.0):
     """Drain all pending/incoming messages for `duration` seconds after TTS.
 
-    ASR pipeline has latency — echo messages arrive after TTS finishes.
-    Keep draining for a few seconds to catch them all.
+    With AEC pipeline active, echo is mostly cancelled.
+    Short flush (1s) catches residual ASR pipeline latency.
     """
     buf = ctypes.create_string_buffer(4096)
     flushed = 0
@@ -2187,12 +2187,14 @@ def _tts_speak_on_device_start(text):
         _tts_process = None
 
 
-def _tts_wait_with_zmq(zmq_lib, sock, wake_texts):
-    """Wait for TTS to finish while checking ZMQ for wake word.
+def _tts_play_with_bargein(response, zmq_lib, sock, wake_texts):
+    """Speak response via TTS with barge-in support.
 
-    Returns extracted question text (str) if wake word interrupted,
-    or None if TTS completed normally.
+    Starts non-blocking TTS and monitors ZMQ for wake word interrupts.
+    Returns extracted question text (str) if barge-in occurred,
+    empty string if wake word only (no question), or None if TTS completed normally.
     """
+    _tts_speak_on_device_start(response)
     global _tts_process
     while _tts_process and _tts_process.poll() is None:
         frames = _zmq_recv_multipart(zmq_lib, sock)
@@ -2206,17 +2208,17 @@ def _tts_wait_with_zmq(zmq_lib, sock, wake_texts):
         except (json.JSONDecodeError, ValueError):
             continue
         if vad_data.get("is_wake_word"):
-            # ウェイクワード検出 → TTS 中断
-            _tts_process.kill()
-            _tts_process = None
+            _tts_cancel()
             text = vad_data.get("text", "").strip()
             extra = text
             for wt in wake_texts:
                 extra = extra.replace(wt, "")
             extra = extra.strip()
-            print(f"[Conversation] wake interrupt during TTS, extra='{extra}'")
+            _zmq_flush(zmq_lib, sock, duration=0)
+            print(f"[Conversation] barge-in during TTS, extra='{extra}'")
             return extra if extra else ""
     _tts_process = None
+    _zmq_flush(zmq_lib, sock, duration=1.0)
     return None
 
 
@@ -2229,6 +2231,58 @@ def _tts_cancel():
         print("[Conversation] TTS cancelled by wake word")
         return True
     return False
+
+
+def _conv_respond_with_bargein(user_text, zmq_lib, sock, wake_texts):
+    """Process user text through LLM, play TTS with barge-in loop.
+
+    Handles repeated barge-ins: if interrupted with a new question,
+    immediately processes it and speaks the new response.
+
+    Returns (last_response_time_or_None, last_utterance_time).
+    - last_response_time is set when TTS completes normally (for wake-skip window)
+    - last_response_time is None when barge-in ended without question
+    """
+    pending_text = user_text
+    while pending_text:
+        _conv_log_append("user", pending_text)
+        print(f"[Conversation] user: {pending_text}")
+        with _conversation_lock:
+            _conversation_state["phase"] = "processing"
+
+        response = _conversation_call_llm(pending_text)
+        _conv_log_append("robot", response)
+        print(f"[Conversation] robot: {response}")
+
+        with _conversation_lock:
+            _conversation_state["turn_count"] += 1
+            _conversation_state["phase"] = "speaking"
+
+        bargein = _tts_play_with_bargein(response, zmq_lib, sock, wake_texts)
+
+        if bargein is None:
+            # TTS completed normally
+            now = time.time()
+            with _conversation_lock:
+                _conversation_state["phase"] = "listening"
+            return now, now
+
+        # Barge-in occurred
+        _conv_log_append("system", "ウェイクワード割り込み — TTS中断")
+        with _conversation_lock:
+            _conversation_state["turn_count"] = 0
+
+        if bargein:
+            # Wake word + question → loop to process immediately
+            pending_text = bargein
+        else:
+            # Wake word only → back to listening
+            with _conversation_lock:
+                _conversation_state["phase"] = "listening"
+            return None, time.time()
+
+    # Should not reach here
+    return None, time.time()
 
 
 def _conv_log_append(role, text):
@@ -2489,22 +2543,9 @@ def _conversation_thread(stop_event):
             with _conversation_lock:
                 phase = _conversation_state["phase"]
 
-            # Speaking: ウェイクワードのみ受付 → TTS中断して新会話開始
+            # Speaking phase: TTS is handled inline by _tts_play_with_bargein,
+            # so this should not normally be reached. Safety fallback.
             if phase == "speaking":
-                if is_wake:
-                    _tts_cancel()
-                    extra_text = text
-                    if extra_text:
-                        for wt in _wake_texts:
-                            extra_text = extra_text.replace(wt, "")
-                        extra_text = extra_text.strip()
-                    _zmq_flush(zmq_lib, sock, duration=0)
-                    with _conversation_lock:
-                        _conversation_state["phase"] = "listening"
-                        _conversation_state["turn_count"] = 0
-                    _conv_log_append("system", "ウェイクワード割り込み — TTS中断")
-                    print(f"[Conversation] wake interrupt during TTS, extra='{extra_text}'")
-                    last_utterance_time = time.time()
                 continue
 
             if phase == "waiting":
@@ -2530,23 +2571,10 @@ def _conversation_thread(stop_event):
                     user_text = extra_text if is_wake else text
                     if user_text:
                         _conv_log_append("system", "ウェイクワード検出" if is_wake else "会話継続 (ウェイクワード省略)")
-                        last_utterance_time = time.time()
-                        _conv_log_append("user", user_text)
-                        print(f"[Conversation] user: {user_text}")
-                        with _conversation_lock:
-                            _conversation_state["phase"] = "processing"
-                        response = _conversation_call_llm(user_text)
-                        _conv_log_append("robot", response)
-                        print(f"[Conversation] robot: {response}")
-                        with _conversation_lock:
-                            _conversation_state["turn_count"] += 1
-                            _conversation_state["phase"] = "speaking"
-                        _tts_speak_on_device(response)
-                        _zmq_flush(zmq_lib, sock)  # にこの声のエコーを破棄
-                        last_response_time = time.time()
-                        with _conversation_lock:
-                            _conversation_state["phase"] = "listening"
-                        last_utterance_time = time.time()
+                        resp_time, utt_time = _conv_respond_with_bargein(
+                            user_text, zmq_lib, sock, _wake_texts)
+                        last_response_time = resp_time or last_response_time
+                        last_utterance_time = utt_time
                         continue
                     else:
                         _conv_log_append("system", "ウェイクワード検出")
@@ -2567,22 +2595,10 @@ def _conversation_thread(stop_event):
                     print("[Conversation] wake word during listening — reset")
                     last_utterance_time = time.time()
                     if extra_text:
-                        _conv_log_append("user", extra_text)
-                        print(f"[Conversation] user: {extra_text}")
-                        with _conversation_lock:
-                            _conversation_state["phase"] = "processing"
-                        response = _conversation_call_llm(extra_text)
-                        _conv_log_append("robot", response)
-                        print(f"[Conversation] robot: {response}")
-                        with _conversation_lock:
-                            _conversation_state["turn_count"] += 1
-                            _conversation_state["phase"] = "speaking"
-                        _tts_speak_on_device(response)
-                        _zmq_flush(zmq_lib, sock)
-                        last_response_time = time.time()
-                        with _conversation_lock:
-                            _conversation_state["phase"] = "listening"
-                        last_utterance_time = time.time()
+                        resp_time, utt_time = _conv_respond_with_bargein(
+                            extra_text, zmq_lib, sock, _wake_texts)
+                        last_response_time = resp_time or last_response_time
+                        last_utterance_time = utt_time
                     continue
                 if not text:
                     continue
@@ -2595,55 +2611,11 @@ def _conversation_thread(stop_event):
                     continue
                 text = cleaned.strip() if cleaned.strip() != text else text
                 last_utterance_time = time.time()
-                _conv_log_append("user", text)
-                print(f"[Conversation] user: {text}")
 
-                # Process: camera + LLM
-                with _conversation_lock:
-                    _conversation_state["phase"] = "processing"
-
-                response = _conversation_call_llm(text)
-                _conv_log_append("robot", response)
-                print(f"[Conversation] robot: {response}")
-
-                with _conversation_lock:
-                    _conversation_state["turn_count"] += 1
-
-                # TTS playback (non-blocking: ZMQ監視でウェイクワード割り込み可能)
-                with _conversation_lock:
-                    _conversation_state["phase"] = "speaking"
-
-                _tts_speak_on_device_start(response)
-                # mpg123 完了まで待ちつつ ZMQ を監視
-                while _tts_process and _tts_process.poll() is None:
-                    frames = _zmq_recv_multipart(zmq_lib, sock)
-                    if frames and len(frames) >= 2:
-                        ps = _msgpack_decode_str(frames[1])
-                        try:
-                            vd = json.loads(ps)
-                        except (json.JSONDecodeError, ValueError):
-                            continue
-                        if vd.get("is_wake_word"):
-                            _tts_cancel()
-                            et = vd.get("text", "").strip()
-                            for wt in _wake_texts:
-                                et = et.replace(wt, "")
-                            et = et.strip()
-                            _zmq_flush(zmq_lib, sock, duration=0)
-                            with _conversation_lock:
-                                _conversation_state["phase"] = "listening"
-                                _conversation_state["turn_count"] = 0
-                            _conv_log_append("system", "ウェイクワード割り込み — TTS中断")
-                            print(f"[Conversation] wake interrupt during TTS, extra='{et}'")
-                            last_utterance_time = time.time()
-                            break
-                else:
-                    # TTS 正常完了
-                    _zmq_flush(zmq_lib, sock)
-                    last_response_time = time.time()
-                    with _conversation_lock:
-                        _conversation_state["phase"] = "listening"
-                    last_utterance_time = time.time()
+                resp_time, utt_time = _conv_respond_with_bargein(
+                    text, zmq_lib, sock, _wake_texts)
+                last_response_time = resp_time or last_response_time
+                last_utterance_time = utt_time
 
     except Exception as e:
         print(f"[Conversation] thread error: {e}")
