@@ -350,6 +350,29 @@
           </div>
         </div>
       </details>
+      <details class="mb-4 bg-gray-800 rounded p-3">
+        <summary class="text-sm text-gray-300 cursor-pointer select-none">対話モード</summary>
+        <div class="mt-3 space-y-3">
+          <div class="flex items-center gap-3">
+            <label class="text-xs text-gray-400 w-24">タイムアウト</label>
+            <input id="conv-timeout" type="number" value="30" min="5" class="w-20 bg-gray-700 border border-gray-600 rounded px-2 py-1 text-sm focus:outline-none focus:border-kata-500">
+            <span class="text-xs text-gray-400">秒</span>
+            <button onclick="saveConvConfig()" class="bg-gray-700 hover:bg-gray-600 text-xs px-3 py-1 rounded transition">設定保存</button>
+          </div>
+          <div class="flex items-center gap-3">
+            <button onclick="enableConversation()" id="conv-enable" class="bg-green-600 hover:bg-green-700 text-white text-xs px-3 py-1 rounded transition font-medium">有効化</button>
+            <button onclick="disableConversation()" id="conv-disable" class="bg-red-600 hover:bg-red-700 text-white text-xs px-3 py-1 rounded transition font-medium" disabled>無効化</button>
+            <span class="text-xs text-gray-400">ステータス:</span>
+            <span id="conv-status" class="text-xs text-gray-500">無効</span>
+          </div>
+          <div class="flex items-center gap-2">
+            <span class="text-xs text-gray-400">フェーズ:</span>
+            <span id="conv-phase" class="text-xs text-gray-500">—</span>
+          </div>
+          <div id="conv-log" class="bg-gray-900 rounded p-2 max-h-48 overflow-y-auto font-mono text-xs leading-relaxed" style="min-height:60px"></div>
+          <p class="text-xs text-gray-500">有効化するとZMQバスからウェイクワードを監視します。検出後の発話をCustom LLM (VLM+カメラ) に送信し、TTSで応答します。</p>
+        </div>
+      </details>
       <p class="text-xs text-gray-500 mb-3">Prompt タブの「Custom LLM プロンプト」にテンプレートを設定。入力テキストが <code class="text-gray-400">{text}</code> に代入されます。カメラONでカメラ映像+テキストをVLM (Qwen3-VL-2B) に送信。</p>
       <div id="custom-result" class="bg-gray-800 rounded p-4 min-h-[100px] hidden">
         <pre class="text-sm whitespace-pre-wrap"></pre>
@@ -711,6 +734,110 @@ async function testLmConnection() {
     status.textContent = '接続失敗: ' + e.message;
     status.className = 'text-xs text-red-400 self-center';
   }
+}
+
+// --- Conversation Mode ---
+let convPollTimer = null;
+
+const CONV_PHASE_LABELS = {
+  disabled: '無効',
+  waiting: '待機中 (ウェイクワード待ち)',
+  listening: '会話中 (発話待ち)',
+  processing: '処理中 (カメラ+LLM)',
+  speaking: '応答中 (TTS再生)',
+};
+
+async function loadConvConfig() {
+  try {
+    const cfg = await apiCall('/api/conversation/config');
+    document.getElementById('conv-timeout').value = cfg.timeout || 30;
+  } catch (e) { /* defaults */ }
+  try {
+    const st = await apiCall('/api/conversation/status');
+    if (st.enabled) {
+      setConvUI(true);
+      startConvPoll();
+      renderConvStatus(st);
+    }
+  } catch (e) { /* ignore */ }
+}
+
+async function saveConvConfig() {
+  const timeout = parseInt(document.getElementById('conv-timeout').value) || 30;
+  await apiCall('/api/conversation/config', {
+    method: 'POST',
+    body: JSON.stringify({ timeout }),
+  });
+}
+
+function setConvUI(enabled) {
+  document.getElementById('conv-enable').disabled = enabled;
+  document.getElementById('conv-disable').disabled = !enabled;
+  document.getElementById('conv-status').textContent = enabled ? '有効' : '無効';
+  document.getElementById('conv-status').className = enabled ? 'text-xs text-green-400' : 'text-xs text-gray-500';
+}
+
+async function enableConversation() {
+  setConvUI(true);
+  try {
+    await apiCall('/api/conversation/enable', { method: 'POST' });
+    startConvPoll();
+  } catch (e) {
+    setConvUI(false);
+  }
+}
+
+async function disableConversation() {
+  stopConvPoll();
+  try {
+    await apiCall('/api/conversation/disable', { method: 'POST' });
+  } catch (e) { /* ignore */ }
+  setConvUI(false);
+  document.getElementById('conv-phase').textContent = '—';
+}
+
+function startConvPoll() {
+  stopConvPoll();
+  convPollTimer = setInterval(pollConvStatus, 2000);
+}
+function stopConvPoll() {
+  if (convPollTimer) { clearInterval(convPollTimer); convPollTimer = null; }
+}
+
+async function pollConvStatus() {
+  try {
+    const st = await apiCall('/api/conversation/status');
+    if (!st.enabled) { setConvUI(false); stopConvPoll(); return; }
+    renderConvStatus(st);
+  } catch (e) { /* ignore */ }
+}
+
+function renderConvStatus(st) {
+  document.getElementById('conv-phase').textContent = CONV_PHASE_LABELS[st.phase] || st.phase;
+  document.getElementById('conv-phase').className = st.phase === 'listening' || st.phase === 'processing' || st.phase === 'speaking'
+    ? 'text-xs text-green-400 font-medium' : 'text-xs text-gray-400';
+  renderConvLog(st.conversation_log || []);
+}
+
+function renderConvLog(log) {
+  const el = document.getElementById('conv-log');
+  if (!log.length) {
+    el.innerHTML = '<span class="text-gray-600">ログなし</span>';
+    return;
+  }
+  el.innerHTML = log.map(e => {
+    let color = 'text-gray-500';
+    let label = '';
+    if (e.role === 'system') { color = 'text-yellow-500'; label = 'システム'; }
+    else if (e.role === 'user') { color = 'text-blue-400'; label = 'ユーザー'; }
+    else if (e.role === 'robot') { color = 'text-green-400'; label = 'ロボット'; }
+    return `<div class="${color}"><span class="text-gray-600">[${e.time}]</span> <span class="font-medium">${label}:</span> ${escapeHtml(e.text)}</div>`;
+  }).join('');
+  el.scrollTop = el.scrollHeight;
+}
+
+function escapeHtml(s) {
+  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 }
 
 // --- Auto Talk Mode (server-side) ---
@@ -2348,7 +2475,7 @@ async function saveWakewords(restart) {
 }
 
 document.addEventListener('DOMContentLoaded', () => {
-  initLogPanel(); loadTtsOptions(); loadLlmBackend(); loadAutoTalkConfig(); loadWakewords();
+  initLogPanel(); loadTtsOptions(); loadLlmBackend(); loadAutoTalkConfig(); loadConvConfig(); loadWakewords();
   document.getElementById('wakeword-new').addEventListener('keydown', e => { if (e.key === 'Enter') addWakeword(); });
 });
 </script>

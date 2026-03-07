@@ -5,11 +5,13 @@ Device dependencies only: Flask 3.0.2, requests, jinja2
 Runs directly on device at /data/devtools/, port 9001.
 """
 
+import ctypes
 import glob
 import hashlib
 import json
 import os
 import re
+import struct
 import subprocess
 import threading
 import time
@@ -1911,6 +1913,436 @@ def auto_talk_status():
             "count": _auto_talk_state["count"],
             "last_result": _auto_talk_state["last_result"],
             "last_time": _auto_talk_state["last_time"],
+        })
+
+
+# --- Conversation mode (wake word → Custom LLM chat) ---
+
+CONVERSATION_CONFIG_PATH = "/data/devtools/conversation_config.json"
+
+_conversation_lock = threading.Lock()
+_conversation_state = {
+    "enabled": False,
+    "phase": "disabled",  # disabled | waiting | listening | processing | speaking
+    "thread": None,
+    "stop_event": None,
+    "auto_talk_was_running": False,
+    "timeout": 30,
+    "conversation_log": [],  # [{role, text, time}, ...] max 50
+    "turn_count": 0,
+}
+
+
+# ZMQ SUB constants (ctypes)
+ZMQ_SUB = 2
+ZMQ_SUBSCRIBE = 6
+ZMQ_RCVTIMEO = 27
+ZMQ_RCVMORE = 13
+
+
+def _zmq_recv_multipart(zmq_lib, socket):
+    """Receive a multipart ZMQ message. Returns list of bytes frames or None on timeout."""
+    frames = []
+    while True:
+        buf = ctypes.create_string_buffer(4096)
+        rc = zmq_lib.zmq_recv(socket, buf, 4096, 0)
+        if rc < 0:
+            return None  # timeout or error
+        frames.append(buf.raw[:rc])
+        # Check ZMQ_RCVMORE
+        more = ctypes.c_int(0)
+        more_size = ctypes.c_size_t(ctypes.sizeof(more))
+        zmq_lib.zmq_getsockopt(socket, ZMQ_RCVMORE, ctypes.byref(more), ctypes.byref(more_size))
+        if not more.value:
+            break
+    return frames
+
+
+def _msgpack_decode_str(data):
+    """Decode a msgpack fixstr/str8/str16 from bytes."""
+    if not data:
+        return ""
+    b0 = data[0]
+    if (b0 & 0xE0) == 0xA0:  # fixstr
+        length = b0 & 0x1F
+        return data[1:1 + length].decode("utf-8", errors="replace")
+    elif b0 == 0xD9:  # str8
+        length = data[1]
+        return data[2:2 + length].decode("utf-8", errors="replace")
+    elif b0 == 0xDA:  # str16
+        length = struct.unpack(">H", data[1:3])[0]
+        return data[3:3 + length].decode("utf-8", errors="replace")
+    return data.decode("utf-8", errors="replace")
+
+
+def _tts_speak_on_device(text):
+    """Synthesize with edge-tts and play on device via mpg123 (blocking)."""
+    import edge_tts
+
+    cfg = _load_tts_config()
+    voice = cfg.get("voice", "ja-JP-NanamiNeural")
+    rate = cfg.get("rate", "+0%")
+    pitch = cfg.get("pitch", "+0Hz")
+
+    mp3_path = "/tmp/tts_conversation.mp3"
+    try:
+        loop = asyncio.new_event_loop()
+        comm = edge_tts.Communicate(text, voice, rate=rate, pitch=pitch)
+        loop.run_until_complete(comm.save(mp3_path))
+        loop.close()
+    except Exception as e:
+        print(f"[Conversation] TTS synthesis error: {e}")
+        return
+
+    try:
+        proc = subprocess.Popen(
+            ["mpg123", "-q", mp3_path],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        proc.wait(timeout=60)
+    except Exception as e:
+        print(f"[Conversation] mpg123 error: {e}")
+
+
+def _conv_log_append(role, text):
+    """Append to conversation log (max 50 entries)."""
+    entry = {"role": role, "text": text, "time": time.strftime("%H:%M:%S")}
+    with _conversation_lock:
+        _conversation_state["conversation_log"].append(entry)
+        if len(_conversation_state["conversation_log"]) > 50:
+            _conversation_state["conversation_log"] = _conversation_state["conversation_log"][-50:]
+
+
+def _pause_auto_talk_for_conversation():
+    """Pause auto-talk mode if running, record state for later resume."""
+    with _auto_talk_lock:
+        if _auto_talk_state["running"]:
+            _auto_talk_state["stop_event"].set()
+            _auto_talk_state["running"] = False
+            with _conversation_lock:
+                _conversation_state["auto_talk_was_running"] = True
+            print("[Conversation] auto-talk paused")
+        else:
+            with _conversation_lock:
+                _conversation_state["auto_talk_was_running"] = False
+
+
+def _resume_auto_talk_after_conversation():
+    """Resume auto-talk mode if it was running before conversation."""
+    with _conversation_lock:
+        was_running = _conversation_state["auto_talk_was_running"]
+        _conversation_state["auto_talk_was_running"] = False
+    if not was_running:
+        return
+    # Load config and restart
+    try:
+        with open(AUTO_TALK_CONFIG_PATH, "r") as f:
+            cfg = json.load(f)
+    except Exception:
+        cfg = {"text": "今何が見える？", "interval": 60}
+    text = cfg.get("text", "今何が見える？")
+    interval = int(cfg.get("interval", 60))
+    with _auto_talk_lock:
+        if _auto_talk_state["running"]:
+            return  # already running
+        stop_event = threading.Event()
+        t = threading.Thread(
+            target=_auto_talk_loop, args=(text, interval, stop_event),
+            daemon=True)
+        _auto_talk_state.update({
+            "running": True,
+            "thread": t,
+            "stop_event": stop_event,
+            "last_result": None,
+            "last_time": None,
+            "count": 0,
+        })
+        t.start()
+    print("[Conversation] auto-talk resumed")
+
+
+def _conversation_call_llm(text):
+    """Camera capture + Custom LLM call. Returns response text or error string."""
+    import base64 as b64mod
+
+    # Read template
+    template = ""
+    if os.path.isfile(CUSTOM_PROMPT_PATH):
+        try:
+            with open(CUSTOM_PROMPT_PATH, "r", encoding="utf-8") as f:
+                template = f.read().strip()
+        except Exception:
+            pass
+    filled = template.format(text=text) if template else text
+
+    # Read config
+    config = {"temperature": 1.3, "max_new_tokens": 4096}
+    if os.path.isfile(CUSTOM_LLM_CONFIG_PATH):
+        try:
+            with open(CUSTOM_LLM_CONFIG_PATH, "r", encoding="utf-8") as f:
+                config.update(json.loads(f.read()))
+        except Exception:
+            pass
+
+    # Capture camera
+    video_dev = "/dev/video12"
+    w, h = 448, 448
+    try:
+        v4l2 = subprocess.Popen(
+            ["v4l2-ctl", "-d", video_dev,
+             "--set-fmt-video", f"width={w},height={h},pixelformat=NV12",
+             "--stream-mmap", "--stream-count=1", "--stream-to=-"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        ffmpeg = subprocess.Popen(
+            ["ffmpeg", "-loglevel", "error",
+             "-f", "rawvideo", "-pix_fmt", "nv12",
+             "-video_size", f"{w}x{h}",
+             "-i", "-", "-frames:v", "1",
+             "-f", "image2pipe", "-vcodec", "mjpeg", "-q:v", "2", "-"],
+            stdin=v4l2.stdout, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        v4l2.stdout.close()
+        jpeg_data, _ = ffmpeg.communicate(timeout=10)
+        v4l2.wait(timeout=5)
+    except Exception as e:
+        return f"[camera error: {e}]"
+    if not jpeg_data:
+        return "[camera capture failed]"
+    image_b64 = b64mod.b64encode(jpeg_data).decode()
+
+    # LLM call
+    backend_cfg = _load_llm_backend_config()
+    if backend_cfg.get("backend") == "lmstudio":
+        try:
+            ext_url = backend_cfg["lmstudio_url"].rstrip("/")
+            messages = [
+                {"role": "system", "content": filled},
+                {"role": "user", "content": [
+                    {"type": "text", "text": text},
+                    {"type": "image_url", "image_url": {
+                        "url": f"data:image/jpeg;base64,{image_b64}"
+                    }},
+                ]},
+            ]
+            return _lmstudio_chat(ext_url, backend_cfg.get("lmstudio_model", ""), messages, config)
+        except Exception as e:
+            return f"[LM Studio error: {e}]"
+    else:
+        try:
+            resp = requests.post(
+                "http://127.0.0.1:8082/rkllm_vlm",
+                json={
+                    "prompt": filled,
+                    "image_base64": image_b64,
+                    "max_new_tokens": int(config.get("max_new_tokens", 512)),
+                },
+                timeout=300,
+            )
+            if resp.status_code == 503:
+                return "[VLM server busy]"
+            result_text = resp.text.strip()
+            result_text = re.sub(
+                r"<think>.*?</think>", "", result_text, flags=re.DOTALL).strip()
+            return result_text
+        except Exception as e:
+            return f"[VLM error: {e}]"
+
+
+def _conversation_thread(stop_event):
+    """Main conversation thread: ZMQ SUB → wake word → LLM → TTS loop."""
+    zmq_lib = ctypes.CDLL("libzmq.so.5")
+    zmq_lib.zmq_ctx_new.restype = ctypes.c_void_p
+    zmq_lib.zmq_socket.restype = ctypes.c_void_p
+    zmq_lib.zmq_socket.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    zmq_lib.zmq_connect.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+    zmq_lib.zmq_recv.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_size_t, ctypes.c_int]
+    zmq_lib.zmq_recv.restype = ctypes.c_int
+    zmq_lib.zmq_setsockopt.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_size_t]
+    zmq_lib.zmq_getsockopt.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.POINTER(ctypes.c_size_t)]
+    zmq_lib.zmq_close.argtypes = [ctypes.c_void_p]
+    zmq_lib.zmq_ctx_destroy.argtypes = [ctypes.c_void_p]
+
+    ctx = zmq_lib.zmq_ctx_new()
+    sock = zmq_lib.zmq_socket(ctx, ZMQ_SUB)
+
+    # Subscribe to /voice/vad_data
+    sub_filter = b"#/voice/vad_data"
+    zmq_lib.zmq_setsockopt(sock, ZMQ_SUBSCRIBE, sub_filter, len(sub_filter))
+
+    # Set receive timeout 1000ms so we can check stop_event
+    timeout_val = ctypes.c_int(1000)
+    zmq_lib.zmq_setsockopt(sock, ZMQ_RCVTIMEO, ctypes.byref(timeout_val), ctypes.sizeof(timeout_val))
+
+    zmq_lib.zmq_connect(sock, b"tcp://127.0.0.1:5559")
+
+    with _conversation_lock:
+        _conversation_state["phase"] = "waiting"
+        _conversation_state["conversation_log"] = []
+        _conversation_state["turn_count"] = 0
+
+    print("[Conversation] ZMQ SUB started, waiting for wake word...")
+
+    last_utterance_time = 0
+
+    try:
+        while not stop_event.is_set():
+            frames = _zmq_recv_multipart(zmq_lib, sock)
+            if frames is None:
+                # Timeout — check if conversation should end
+                with _conversation_lock:
+                    phase = _conversation_state["phase"]
+                    timeout = _conversation_state["timeout"]
+                if phase == "listening" and last_utterance_time > 0:
+                    elapsed = time.time() - last_utterance_time
+                    if elapsed > timeout:
+                        _conv_log_append("system", "タイムアウト — 会話終了")
+                        with _conversation_lock:
+                            _conversation_state["phase"] = "waiting"
+                            _conversation_state["turn_count"] = 0
+                        _resume_auto_talk_after_conversation()
+                        print("[Conversation] timeout, back to waiting")
+                        last_utterance_time = 0
+                continue
+
+            # Parse vad_data: frames[0]=topic, frames[1]=msgpack payload
+            if len(frames) < 2:
+                continue
+
+            payload_str = _msgpack_decode_str(frames[1])
+            try:
+                vad_data = json.loads(payload_str)
+            except (json.JSONDecodeError, ValueError):
+                continue
+
+            is_wake = vad_data.get("is_wake_word", False)
+            text = vad_data.get("text", "").strip()
+
+            with _conversation_lock:
+                phase = _conversation_state["phase"]
+
+            # Ignore everything while speaking (mic feedback prevention)
+            if phase == "speaking":
+                continue
+
+            if phase == "waiting":
+                if is_wake:
+                    # Wake word detected → start conversation
+                    _pause_auto_talk_for_conversation()
+                    with _conversation_lock:
+                        _conversation_state["phase"] = "listening"
+                        _conversation_state["turn_count"] = 0
+                    _conv_log_append("system", "ウェイクワード検出")
+                    last_utterance_time = time.time()
+                    print("[Conversation] wake word detected, listening...")
+
+            elif phase == "listening":
+                if not text or is_wake:
+                    continue
+                last_utterance_time = time.time()
+                _conv_log_append("user", text)
+                print(f"[Conversation] user: {text}")
+
+                # Process: camera + LLM
+                with _conversation_lock:
+                    _conversation_state["phase"] = "processing"
+
+                response = _conversation_call_llm(text)
+                _conv_log_append("robot", response)
+                print(f"[Conversation] robot: {response}")
+
+                with _conversation_lock:
+                    _conversation_state["turn_count"] += 1
+
+                # TTS playback (blocking)
+                with _conversation_lock:
+                    _conversation_state["phase"] = "speaking"
+
+                _tts_speak_on_device(response)
+
+                # Back to listening
+                with _conversation_lock:
+                    _conversation_state["phase"] = "listening"
+                last_utterance_time = time.time()
+
+    except Exception as e:
+        print(f"[Conversation] thread error: {e}")
+    finally:
+        zmq_lib.zmq_close(sock)
+        zmq_lib.zmq_ctx_destroy(ctx)
+        with _conversation_lock:
+            _conversation_state["phase"] = "disabled"
+            _conversation_state["enabled"] = False
+        print("[Conversation] thread stopped")
+
+
+def _load_conversation_config():
+    try:
+        with open(CONVERSATION_CONFIG_PATH, "r") as f:
+            return json.load(f)
+    except Exception:
+        return {"timeout": 30}
+
+
+def _save_conversation_config(cfg):
+    os.makedirs(os.path.dirname(CONVERSATION_CONFIG_PATH), exist_ok=True)
+    with open(CONVERSATION_CONFIG_PATH, "w") as f:
+        json.dump(cfg, f, ensure_ascii=False, indent=2)
+
+
+@app.get("/api/conversation/config")
+def conversation_config_get():
+    return jsonify(_load_conversation_config())
+
+
+@app.post("/api/conversation/config")
+def conversation_config_save():
+    data = request.get_json(force=True)
+    cfg = {"timeout": int(data.get("timeout", 30))}
+    _save_conversation_config(cfg)
+    with _conversation_lock:
+        _conversation_state["timeout"] = cfg["timeout"]
+    return jsonify({"status": "ok"})
+
+
+@app.post("/api/conversation/enable")
+def conversation_enable():
+    with _conversation_lock:
+        if _conversation_state["enabled"]:
+            return jsonify({"status": "already_enabled"})
+        cfg = _load_conversation_config()
+        _conversation_state["timeout"] = cfg.get("timeout", 30)
+        stop_event = threading.Event()
+        t = threading.Thread(
+            target=_conversation_thread, args=(stop_event,),
+            daemon=True)
+        _conversation_state.update({
+            "enabled": True,
+            "thread": t,
+            "stop_event": stop_event,
+        })
+        t.start()
+    return jsonify({"status": "enabled"})
+
+
+@app.post("/api/conversation/disable")
+def conversation_disable():
+    with _conversation_lock:
+        if not _conversation_state["enabled"]:
+            return jsonify({"status": "not_enabled"})
+        _conversation_state["stop_event"].set()
+        _conversation_state["enabled"] = False
+        _conversation_state["phase"] = "disabled"
+    return jsonify({"status": "disabled"})
+
+
+@app.get("/api/conversation/status")
+def conversation_status():
+    with _conversation_lock:
+        return jsonify({
+            "enabled": _conversation_state["enabled"],
+            "phase": _conversation_state["phase"],
+            "turn_count": _conversation_state["turn_count"],
+            "conversation_log": _conversation_state["conversation_log"],
+            "auto_talk_was_running": _conversation_state["auto_talk_was_running"],
         })
 
 
