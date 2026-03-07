@@ -774,25 +774,32 @@ def _read_cameras():
 
 
 def _read_amixer_control(name):
-    """Read a single amixer control, return (value, min, max, percent) or None."""
+    """Read a single amixer control, return {value, min, max, percent} or None."""
     try:
         out = subprocess.check_output(
             ["amixer", "get", name], timeout=3, stderr=subprocess.DEVNULL
         ).decode(errors="ignore")
-        # Try percentage first
+        # Parse limits: "Limits: 0 - 14" or "Limits: Capture 0 - 255"
+        m_range = re.search(r'Limits:.*?(\d+)\s*-\s*(\d+)', out)
+        # Parse raw value: "Mono: 14 [100%]" or "Mono: Capture 191 [75%]"
+        m_raw = re.search(r'Mono:.*?(\d+)\s*\[', out)
         m_pct = re.search(r'\[(\d+)%\]', out)
-        if m_pct:
-            return {"value": int(m_pct.group(1)), "percent": int(m_pct.group(1))}
-        # Try raw integer value with limits
-        m_val = re.search(r':\s*values=(\d+)', out)
-        m_range = re.search(r'min=(\d+),max=(\d+)', out)
-        if m_val and m_range:
-            val = int(m_val.group(1))
+        if m_raw and m_range:
+            val = int(m_raw.group(1))
             vmin, vmax = int(m_range.group(1)), int(m_range.group(2))
+            pct = int(m_pct.group(1)) if m_pct else (
+                round((val - vmin) / (vmax - vmin) * 100) if vmax > vmin else 0)
+            return {"value": val, "min": vmin, "max": vmax, "percent": pct}
+        # Fallback: numid style "values=N"
+        m_val = re.search(r':\s*values=(\d+)', out)
+        m_range2 = re.search(r'min=(\d+),max=(\d+)', out)
+        if m_val and m_range2:
+            val = int(m_val.group(1))
+            vmin, vmax = int(m_range2.group(1)), int(m_range2.group(2))
             pct = round((val - vmin) / (vmax - vmin) * 100) if vmax > vmin else 0
             return {"value": val, "min": vmin, "max": vmax, "percent": pct}
-        if m_val:
-            return {"value": int(m_val.group(1))}
+        if m_pct:
+            return {"value": int(m_pct.group(1)), "percent": int(m_pct.group(1))}
     except Exception:
         pass
     return None
@@ -825,7 +832,7 @@ def _read_audio():
         pass
     # Microphone controls
     mic = {}
-    for name in ("ADCL Capture", "ADCR Capture", "ADCL PGA", "ADCR PGA",
+    for name in ("ADCL", "ADCR", "ADCL PGA", "ADCR PGA",
                  "Main Mic", "Headset Mic"):
         ctrl = _read_amixer_control(name)
         if ctrl is not None:
@@ -1012,7 +1019,7 @@ def set_mic():
     value = data.get("value")
     if not control or value is None:
         return flask_error(400, "control and value are required")
-    allowed = {"ADCL Capture", "ADCR Capture", "ADCL PGA", "ADCR PGA",
+    allowed = {"ADCL", "ADCR", "ADCL PGA", "ADCR PGA",
                "Main Mic", "Headset Mic"}
     if control not in allowed:
         return flask_error(400, f"unknown control: {control}")

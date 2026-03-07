@@ -2012,14 +2012,15 @@ async function loadSensors() {
           micSection.classList.remove('hidden');
           const micEl = document.getElementById('mic-controls');
           if (micEl) {
-            const gainControls = ["ADCL Capture", "ADCR Capture", "ADCL PGA", "ADCR PGA"];
+            const gainControls = ["ADCL", "ADCR", "ADCL PGA", "ADCR PGA"];
+            const labelMap = {"ADCL": "L-Capture", "ADCR": "R-Capture", "ADCL PGA": "L-PGA (増幅)", "ADCR PGA": "R-PGA (増幅)"};
             const switchControls = ["Main Mic", "Headset Mic"];
             let micHtml = '';
             gainControls.forEach(name => {
               const c = micData[name];
               if (!c) return;
               const pct = c.percent ?? 0;
-              const label = name.replace('ADCL ', 'L-').replace('ADCR ', 'R-');
+              const label = labelMap[name] || name;
               micHtml += `<div class="flex items-center gap-3">
                 <span class="text-sm text-gray-400 w-24">${label}</span>
                 <input type="range" min="${c.min ?? 0}" max="${c.max ?? 100}" value="${c.value}"
