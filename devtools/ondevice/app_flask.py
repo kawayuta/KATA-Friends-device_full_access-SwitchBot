@@ -9,6 +9,7 @@ import ctypes
 import glob
 import hashlib
 import json
+import datetime
 import os
 import re
 import struct
@@ -414,6 +415,12 @@ def execute_action():
 
 def _lmstudio_chat(ext_url, model, messages, config, api_key=""):
     """Send chat request to LM Studio (OpenAI compatible)."""
+    # Inject current date into system message
+    today = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=9))).strftime("%Y年%m月%d日 %H:%M")
+    for msg in messages:
+        if msg.get("role") == "system" and isinstance(msg.get("content"), str):
+            msg["content"] = f"現在の日時: {today}\n\n{msg['content']}"
+            break
     payload = {
         "model": model,
         "messages": messages,
@@ -463,10 +470,12 @@ def _lmstudio_chat_mcp(base_url, model, messages, config, mcp_servers,
             parts.append(content)
     input_text = "\n\n".join(parts)
 
-    # Force tool use: prepend strong instruction in input
+    # Inject current date + force tool use instruction
+    today = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=9))).strftime("%Y年%m月%d日 %H:%M")
     tool_names = ", ".join(mcp_servers)
     input_text = (
         f"<|system|>\n"
+        f"現在の日時: {today}\n"
         f"MANDATORY: You MUST call at least one tool ({tool_names}) before generating ANY text response. "
         "Do NOT answer from your own knowledge. Do NOT skip tool calls. "
         "First call a tool, wait for the result, then respond based ONLY on the tool output. "
@@ -2319,6 +2328,8 @@ def _conversation_thread(stop_event):
     print("[Conversation] ZMQ SUB started, waiting for wake word...")
 
     last_utterance_time = 0
+    last_response_time = 0  # TTS再生完了時刻 (ウェイクワード省略判定用)
+    WAKE_SKIP_WINDOW = 10   # 秒以内ならウェイクワード不要
 
     try:
         while not stop_event.is_set():
@@ -2361,15 +2372,40 @@ def _conversation_thread(stop_event):
                 continue
 
             if phase == "waiting":
-                if is_wake:
-                    # Wake word detected → start conversation
+                # ウェイクワード or 直前の応答から10秒以内の発話で会話開始
+                wake_skip = (last_response_time > 0
+                             and (time.time() - last_response_time) < WAKE_SKIP_WINDOW
+                             and text and not is_wake)
+                if is_wake or wake_skip:
                     _pause_auto_talk_for_conversation()
                     with _conversation_lock:
                         _conversation_state["phase"] = "listening"
                         _conversation_state["turn_count"] = 0
-                    _conv_log_append("system", "ウェイクワード検出")
-                    last_utterance_time = time.time()
-                    print("[Conversation] wake word detected, listening...")
+                    if wake_skip:
+                        _conv_log_append("system", "会話継続 (ウェイクワード省略)")
+                        print("[Conversation] wake skip — continuing within 10s window")
+                        # wake_skip の場合、この発話を直接処理する
+                        last_utterance_time = time.time()
+                        _conv_log_append("user", text)
+                        print(f"[Conversation] user: {text}")
+                        with _conversation_lock:
+                            _conversation_state["phase"] = "processing"
+                        response = _conversation_call_llm(text)
+                        _conv_log_append("robot", response)
+                        print(f"[Conversation] robot: {response}")
+                        with _conversation_lock:
+                            _conversation_state["turn_count"] += 1
+                            _conversation_state["phase"] = "speaking"
+                        _tts_speak_on_device(response)
+                        last_response_time = time.time()
+                        with _conversation_lock:
+                            _conversation_state["phase"] = "listening"
+                        last_utterance_time = time.time()
+                        continue
+                    else:
+                        _conv_log_append("system", "ウェイクワード検出")
+                        last_utterance_time = time.time()
+                        print("[Conversation] wake word detected, listening...")
 
             elif phase == "listening":
                 if not text or is_wake:
@@ -2394,6 +2430,7 @@ def _conversation_thread(stop_event):
                     _conversation_state["phase"] = "speaking"
 
                 _tts_speak_on_device(response)
+                last_response_time = time.time()
 
                 # Back to listening
                 with _conversation_lock:
