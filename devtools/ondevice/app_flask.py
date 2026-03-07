@@ -470,16 +470,15 @@ def _lmstudio_chat_mcp(base_url, model, messages, config, mcp_servers,
             parts.append(content)
     input_text = "\n\n".join(parts)
 
-    # Inject current date + force tool use instruction
+    # Inject current date + tool use instruction
     today = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=9))).strftime("%Y年%m月%d日 %H:%M")
     tool_names = ", ".join(mcp_servers)
     input_text = (
         f"<|system|>\n"
         f"現在の日時: {today}\n"
-        f"MANDATORY: You MUST call at least one tool ({tool_names}) before generating ANY text response. "
-        "Do NOT answer from your own knowledge. Do NOT skip tool calls. "
-        "First call a tool, wait for the result, then respond based ONLY on the tool output. "
-        "If you respond without calling a tool first, your response will be REJECTED.\n"
+        f"You MUST call at least one tool ({tool_names}) before answering. "
+        "You may call tools up to 3 times maximum. After that, give your final answer immediately. "
+        "Do NOT repeat the same search query.\n"
         f"<|user|>\n{input_text}"
     )
 
