@@ -11,6 +11,7 @@ import json
 import os
 import re
 import subprocess
+import threading
 import time
 import uuid
 
@@ -1700,9 +1701,120 @@ def tts_synthesize():
     return jsonify({"status": "ok"})
 
 
-# --- Auto-talk config ---
+# --- Auto-talk (server-side loop) ---
 
 AUTO_TALK_CONFIG_PATH = "/data/devtools/auto_talk_config.json"
+
+_auto_talk_lock = threading.Lock()
+_auto_talk_state = {
+    "running": False,
+    "thread": None,
+    "stop_event": None,
+    "last_result": None,
+    "last_time": None,
+    "count": 0,
+}
+
+
+def _auto_talk_loop(text, interval, stop_event):
+    """Background thread: periodically capture camera + call VLM."""
+    import base64 as b64mod
+
+    while not stop_event.is_set():
+        result_entry = {"time": time.strftime("%H:%M:%S"), "text": text}
+        try:
+            # Read template
+            template = ""
+            if os.path.isfile(CUSTOM_PROMPT_PATH):
+                with open(CUSTOM_PROMPT_PATH, "r", encoding="utf-8") as f:
+                    template = f.read().strip()
+            filled = template.format(text=text) if template else text
+
+            # Read config
+            config = {"temperature": 1.3, "max_new_tokens": 4096}
+            if os.path.isfile(CUSTOM_LLM_CONFIG_PATH):
+                try:
+                    with open(CUSTOM_LLM_CONFIG_PATH, "r", encoding="utf-8") as f:
+                        config.update(json.loads(f.read()))
+                except Exception:
+                    pass
+
+            # Capture camera
+            video_dev = "/dev/video12"
+            w, h = 448, 448
+            v4l2 = subprocess.Popen(
+                ["v4l2-ctl", "-d", video_dev,
+                 "--set-fmt-video", f"width={w},height={h},pixelformat=NV12",
+                 "--stream-mmap", "--stream-count=1", "--stream-to=-"],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            ffmpeg = subprocess.Popen(
+                ["ffmpeg", "-loglevel", "error",
+                 "-f", "rawvideo", "-pix_fmt", "nv12",
+                 "-video_size", f"{w}x{h}",
+                 "-i", "-", "-frames:v", "1",
+                 "-f", "image2pipe", "-vcodec", "mjpeg", "-q:v", "2", "-"],
+                stdin=v4l2.stdout, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            v4l2.stdout.close()
+            jpeg_data, _ = ffmpeg.communicate(timeout=10)
+            v4l2.wait(timeout=5)
+            if not jpeg_data:
+                result_entry["error"] = "camera capture failed"
+            else:
+                image_b64 = b64mod.b64encode(jpeg_data).decode()
+
+                # Check backend
+                backend_cfg = _load_llm_backend_config()
+                if backend_cfg.get("backend") == "lmstudio":
+                    ext_url = backend_cfg["lmstudio_url"].rstrip("/")
+                    messages = [
+                        {"role": "system", "content": filled},
+                        {"role": "user", "content": [
+                            {"type": "text", "text": text},
+                            {"type": "image_url", "image_url": {
+                                "url": f"data:image/jpeg;base64,{image_b64}"
+                            }},
+                        ]},
+                    ]
+                    result_text = _lmstudio_chat(
+                        ext_url, backend_cfg.get("lmstudio_model", ""),
+                        messages, config)
+                    result_entry["result"] = result_text
+                    result_entry["mode"] = "vlm"
+                else:
+                    resp = requests.post(
+                        "http://127.0.0.1:8082/rkllm_vlm",
+                        json={
+                            "prompt": filled,
+                            "image_base64": image_b64,
+                            "max_new_tokens": int(config.get("max_new_tokens", 512)),
+                        },
+                        timeout=300,
+                    )
+                    if resp.status_code == 503:
+                        result_entry["error"] = "VLM server busy"
+                    else:
+                        result_text = resp.text.strip()
+                        result_text = re.sub(
+                            r"<think>.*?</think>", "", result_text,
+                            flags=re.DOTALL).strip()
+                        result_entry["result"] = result_text
+                        result_entry["mode"] = "vlm"
+        except Exception as e:
+            result_entry["error"] = str(e)
+
+        with _auto_talk_lock:
+            _auto_talk_state["last_result"] = result_entry
+            _auto_talk_state["last_time"] = time.time()
+            _auto_talk_state["count"] += 1
+
+        # Wait for interval (check stop_event every second)
+        for _ in range(interval):
+            if stop_event.is_set():
+                break
+            time.sleep(1)
+
+    with _auto_talk_lock:
+        _auto_talk_state["running"] = False
 
 
 @app.get("/api/auto-talk/config")
@@ -1724,6 +1836,52 @@ def auto_talk_config_save():
     with open(AUTO_TALK_CONFIG_PATH, "w") as f:
         json.dump(cfg, f, ensure_ascii=False, indent=2)
     return jsonify({"status": "ok"})
+
+
+@app.post("/api/auto-talk/start")
+def auto_talk_start():
+    data = request.get_json(force=True)
+    text = data.get("text", "").strip()
+    interval = int(data.get("interval", 60))
+    if not text:
+        return flask_error(400, "text is required")
+    with _auto_talk_lock:
+        if _auto_talk_state["running"]:
+            return jsonify({"status": "already_running"})
+        stop_event = threading.Event()
+        t = threading.Thread(
+            target=_auto_talk_loop, args=(text, interval, stop_event),
+            daemon=True)
+        _auto_talk_state.update({
+            "running": True,
+            "thread": t,
+            "stop_event": stop_event,
+            "last_result": None,
+            "last_time": None,
+            "count": 0,
+        })
+        t.start()
+    return jsonify({"status": "started"})
+
+
+@app.post("/api/auto-talk/stop")
+def auto_talk_stop():
+    with _auto_talk_lock:
+        if not _auto_talk_state["running"]:
+            return jsonify({"status": "not_running"})
+        _auto_talk_state["stop_event"].set()
+    return jsonify({"status": "stopping"})
+
+
+@app.get("/api/auto-talk/status")
+def auto_talk_status():
+    with _auto_talk_lock:
+        return jsonify({
+            "running": _auto_talk_state["running"],
+            "count": _auto_talk_state["count"],
+            "last_result": _auto_talk_state["last_result"],
+            "last_time": _auto_talk_state["last_time"],
+        })
 
 
 # --- Static file serving ---

@@ -676,9 +676,9 @@ async function testLmConnection() {
   }
 }
 
-// --- Auto Talk Mode ---
-let autoTalkTimer = null;
-let autoTalkBusy = false;
+// --- Auto Talk Mode (server-side) ---
+let autoTalkPollTimer = null;
+let autoTalkLastCount = -1;
 
 async function loadAutoTalkConfig() {
   try {
@@ -686,6 +686,15 @@ async function loadAutoTalkConfig() {
     document.getElementById('auto-talk-text').value = cfg.text || '今何が見える？';
     document.getElementById('auto-talk-interval').value = cfg.interval || 60;
   } catch (e) { /* use defaults */ }
+  try {
+    const st = await apiCall('/api/auto-talk/status');
+    if (st.running) {
+      setAutoTalkUI(true);
+      autoTalkLastCount = st.count;
+      startAutoTalkPoll();
+      if (st.last_result) showAutoTalkResult(st.last_result);
+    }
+  } catch (e) { /* ignore */ }
 }
 
 async function saveAutoTalkConfig() {
@@ -697,49 +706,118 @@ async function saveAutoTalkConfig() {
   });
 }
 
-function startAutoTalk() {
-  if (autoTalkTimer) return;
+function setAutoTalkUI(running) {
+  document.getElementById('auto-talk-start').disabled = running;
+  document.getElementById('auto-talk-stop').disabled = !running;
+  document.getElementById('auto-talk-status').textContent = running ? '実行中' : '停止中';
+  document.getElementById('auto-talk-status').className = running ? 'text-xs text-green-400' : 'text-xs text-gray-500';
+  if (running) document.getElementById('custom-use-camera').checked = true;
+}
+
+async function startAutoTalk() {
   const text = document.getElementById('auto-talk-text').value.trim();
-  const interval = (parseInt(document.getElementById('auto-talk-interval').value) || 60) * 1000;
+  const interval = parseInt(document.getElementById('auto-talk-interval').value) || 60;
   if (!text) return;
-  document.getElementById('auto-talk-start').disabled = true;
-  document.getElementById('auto-talk-stop').disabled = false;
-  document.getElementById('auto-talk-status').textContent = '実行中';
-  document.getElementById('auto-talk-status').className = 'text-xs text-green-400';
-  autoTalkOnce(text);
-  autoTalkTimer = setInterval(() => autoTalkOnce(text), interval);
-}
-
-function stopAutoTalk() {
-  if (autoTalkTimer) { clearInterval(autoTalkTimer); autoTalkTimer = null; }
-  document.getElementById('auto-talk-start').disabled = false;
-  document.getElementById('auto-talk-stop').disabled = true;
-  document.getElementById('auto-talk-status').textContent = '停止中';
-  document.getElementById('auto-talk-status').className = 'text-xs text-gray-500';
-}
-
-async function autoTalkOnce(text) {
-  if (autoTalkBusy) return;
-  autoTalkBusy = true;
+  setAutoTalkUI(true);
+  autoTalkLastCount = -1;
   const resultEl = document.getElementById('custom-result');
   resultEl.classList.remove('hidden');
-  resultEl.querySelector('pre').textContent = '[語りかけ] カメラ撮影+推論中...';
+  resultEl.querySelector('pre').textContent = '[語りかけ] 開始中...';
   try {
-    const data = await apiCall('/api/custom-llm', {
+    await apiCall('/api/auto-talk/start', {
       method: 'POST',
-      body: JSON.stringify({ text, use_camera: true }),
+      body: JSON.stringify({ text, interval }),
     });
-    const ts = new Date().toLocaleTimeString('ja-JP', { hour12: false });
-    if (data.error) {
-      resultEl.querySelector('pre').textContent = `[${ts}] エラー: ${data.error}`;
-    } else {
-      const modeLabel = data.mode === 'vlm' ? '[VLM] ' : '';
-      resultEl.querySelector('pre').textContent = `[${ts}] ${modeLabel}${data.result || '(empty)'}`;
-    }
+    startAutoTalkPoll();
   } catch (e) {
-    resultEl.querySelector('pre').textContent = '[語りかけ] エラー: ' + e.message;
+    resultEl.querySelector('pre').textContent = '[語りかけ] 開始エラー: ' + e.message;
+    setAutoTalkUI(false);
   }
-  autoTalkBusy = false;
+}
+
+async function stopAutoTalk() {
+  stopAutoTalkPoll();
+  try {
+    await apiCall('/api/auto-talk/stop', { method: 'POST' });
+  } catch (e) { /* ignore */ }
+  setAutoTalkUI(false);
+}
+
+function startAutoTalkPoll() {
+  stopAutoTalkPoll();
+  autoTalkPollTimer = setInterval(pollAutoTalkStatus, 3000);
+}
+function stopAutoTalkPoll() {
+  if (autoTalkPollTimer) { clearInterval(autoTalkPollTimer); autoTalkPollTimer = null; }
+}
+
+async function pollAutoTalkStatus() {
+  try {
+    const st = await apiCall('/api/auto-talk/status');
+    if (!st.running) { setAutoTalkUI(false); stopAutoTalkPoll(); return; }
+    if (st.last_result && st.count !== autoTalkLastCount) {
+      autoTalkLastCount = st.count;
+      showAutoTalkResult(st.last_result);
+    }
+  } catch (e) { /* ignore */ }
+}
+
+function showAutoTalkResult(r) {
+  const resultEl = document.getElementById('custom-result');
+  resultEl.classList.remove('hidden');
+  const ts = r.time || '';
+  if (r.error) {
+    resultEl.querySelector('pre').textContent = `[${ts}] エラー: ${r.error}`;
+  } else {
+    const modeLabel = r.mode === 'vlm' ? '[VLM] ' : '';
+    resultEl.querySelector('pre').textContent = `[${ts}] ${modeLabel}${r.result || '(empty)'}`;
+  }
+  // TTS (browser-side playback when page is open)
+  const useTts = document.getElementById('custom-tts').checked;
+  if (useTts && r.result && !r.error) {
+    autoTalkTts(r.result, ts, r.mode);
+  }
+}
+
+async function autoTalkTts(resultText, ts, mode) {
+  const resultEl = document.getElementById('custom-result');
+  const modeLabel = mode === 'vlm' ? '[VLM] ' : '';
+  const playback = document.getElementById('tts-playback').value;
+  resultEl.querySelector('pre').textContent += '\n\n(読み上げ中...)';
+  try {
+    const ttsBase = {
+      text: resultText,
+      voice: document.getElementById('tts-voice').value,
+      rate: document.getElementById('tts-rate').value,
+      pitch: ttsPitchStr(),
+    };
+    const doBrowser = playback === 'browser' || playback === 'both';
+    const doDevice = playback === 'device' || playback === 'both';
+    if (doDevice && !doBrowser) {
+      await apiCall('/api/tts', { method: 'POST', body: JSON.stringify({ ...ttsBase, browser: false }) });
+    } else if (doBrowser) {
+      const res = await fetch('/api/tts', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ...ttsBase, browser: true }),
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.detail || 'TTS API error ' + res.status);
+      }
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const audio = new Audio(url);
+      audio.onended = () => URL.revokeObjectURL(url);
+      audio.play();
+      if (doDevice) {
+        await apiCall('/api/tts', { method: 'POST', body: JSON.stringify({ ...ttsBase, browser: false }) });
+      }
+    }
+    resultEl.querySelector('pre').textContent = `[${ts}] ${modeLabel}${resultText}\n\n(読み上げ完了)`;
+  } catch (te) {
+    resultEl.querySelector('pre').textContent = `[${ts}] ${modeLabel}${resultText}\n\nTTSエラー: ${te.message}`;
+  }
 }
 
 // --- Custom LLM ---
