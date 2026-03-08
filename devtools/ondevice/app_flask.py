@@ -2435,30 +2435,36 @@ def _conversation_call_llm(text):
         except Exception:
             pass
 
-    # Capture camera
-    video_dev = "/dev/video12"
-    w, h = 448, 448
-    try:
-        v4l2 = subprocess.Popen(
-            ["v4l2-ctl", "-d", video_dev,
-             "--set-fmt-video", f"width={w},height={h},pixelformat=NV12",
-             "--stream-mmap", "--stream-count=1", "--stream-to=-"],
-            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-        ffmpeg = subprocess.Popen(
-            ["ffmpeg", "-loglevel", "error",
-             "-f", "rawvideo", "-pix_fmt", "nv12",
-             "-video_size", f"{w}x{h}",
-             "-i", "-", "-frames:v", "1",
-             "-f", "image2pipe", "-vcodec", "mjpeg", "-q:v", "2", "-"],
-            stdin=v4l2.stdout, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-        v4l2.stdout.close()
-        jpeg_data, _ = ffmpeg.communicate(timeout=10)
-        v4l2.wait(timeout=5)
-    except Exception as e:
-        return f"[camera error: {e}]"
-    if not jpeg_data:
-        return "[camera capture failed]"
-    image_b64 = b64mod.b64encode(jpeg_data).decode()
+    # Check camera setting
+    conv_cfg = _load_conversation_config()
+    use_camera = conv_cfg.get("use_camera", True)
+
+    # Capture camera (only when enabled)
+    image_b64 = None
+    if use_camera:
+        video_dev = "/dev/video12"
+        w, h = 448, 448
+        try:
+            v4l2 = subprocess.Popen(
+                ["v4l2-ctl", "-d", video_dev,
+                 "--set-fmt-video", f"width={w},height={h},pixelformat=NV12",
+                 "--stream-mmap", "--stream-count=1", "--stream-to=-"],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            ffmpeg = subprocess.Popen(
+                ["ffmpeg", "-loglevel", "error",
+                 "-f", "rawvideo", "-pix_fmt", "nv12",
+                 "-video_size", f"{w}x{h}",
+                 "-i", "-", "-frames:v", "1",
+                 "-f", "image2pipe", "-vcodec", "mjpeg", "-q:v", "2", "-"],
+                stdin=v4l2.stdout, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            v4l2.stdout.close()
+            jpeg_data, _ = ffmpeg.communicate(timeout=10)
+            v4l2.wait(timeout=5)
+        except Exception as e:
+            return f"[camera error: {e}]"
+        if not jpeg_data:
+            return "[camera capture failed]"
+        image_b64 = b64mod.b64encode(jpeg_data).decode()
 
     # LLM call
     backend_cfg = _load_llm_backend_config()
@@ -2466,18 +2472,23 @@ def _conversation_call_llm(text):
         try:
             ext_url = backend_cfg["lmstudio_url"].rstrip("/")
             model = backend_cfg.get("lmstudio_model", "")
-            messages = [
-                {"role": "system", "content": filled},
-                {"role": "user", "content": [
-                    {"type": "text", "text": text},
-                    {"type": "image_url", "image_url": {
-                        "url": f"data:image/jpeg;base64,{image_b64}"
-                    }},
-                ]},
-            ]
-            # MCP tool support: use active servers for conversation mode
-            conv_cfg = _load_conversation_config()
-            active_servers = conv_cfg.get("conv_active_servers", [])
+            if image_b64:
+                messages = [
+                    {"role": "system", "content": filled},
+                    {"role": "user", "content": [
+                        {"type": "text", "text": text},
+                        {"type": "image_url", "image_url": {
+                            "url": f"data:image/jpeg;base64,{image_b64}"
+                        }},
+                    ]},
+                ]
+            else:
+                messages = [
+                    {"role": "system", "content": filled},
+                    {"role": "user", "content": text},
+                ]
+            # MCP tool support: only for camera-off (text-only) mode
+            active_servers = conv_cfg.get("conv_active_servers", []) if not use_camera else []
             api_key = backend_cfg.get("lmstudio_api_key", "")
             # Conversation continuation: reuse response_id if within 60 seconds
             now = time.time()
@@ -2505,23 +2516,35 @@ def _conversation_call_llm(text):
             return f"[LM Studio error: {e}]"
     else:
         try:
-            resp = requests.post(
-                "http://127.0.0.1:8082/rkllm_vlm",
-                json={
-                    "prompt": filled,
-                    "image_base64": image_b64,
-                    "max_new_tokens": int(config.get("max_new_tokens", 512)),
-                },
-                timeout=300,
-            )
+            if image_b64:
+                resp = requests.post(
+                    "http://127.0.0.1:8082/rkllm_vlm",
+                    json={
+                        "prompt": filled,
+                        "image_base64": image_b64,
+                        "max_new_tokens": int(config.get("max_new_tokens", 512)),
+                    },
+                    timeout=300,
+                )
+            else:
+                resp = requests.post(
+                    "http://127.0.0.1:8082/rkllm_diary",
+                    json={
+                        "task": "custom",
+                        "prompt": filled,
+                        "temperature": float(config.get("temperature", 1.3)),
+                        "max_new_tokens": int(config.get("max_new_tokens", 4096)),
+                    },
+                    timeout=300,
+                )
             if resp.status_code == 503:
-                return "[VLM server busy]"
+                return "[LLM server busy]"
             result_text = resp.text.strip()
             result_text = re.sub(
                 r"<think>.*?</think>", "", result_text, flags=re.DOTALL).strip()
             return result_text
         except Exception as e:
-            return f"[VLM error: {e}]"
+            return f"[LLM error: {e}]"
 
 
 def _conversation_thread(stop_event):
@@ -2797,6 +2820,7 @@ def conversation_config_save():
         "timeout": int(data.get("timeout", 5)),
         "mcp_servers": list(data.get("mcp_servers", [])),
         "conv_active_servers": list(data.get("conv_active_servers", [])),
+        "use_camera": bool(data.get("use_camera", True)),
     }
     _save_conversation_config(cfg)
     with _conversation_lock:

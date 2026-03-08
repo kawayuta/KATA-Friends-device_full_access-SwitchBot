@@ -366,6 +366,13 @@
             <button onclick="saveConvConfig()" class="bg-gray-700 hover:bg-gray-600 text-xs px-3 py-1 rounded transition">設定保存</button>
           </div>
           <div class="flex items-center gap-3">
+            <label class="text-xs text-gray-400 w-24">カメラ</label>
+            <label class="text-xs text-gray-400 flex items-center gap-1">
+              <input type="checkbox" id="conv-use-camera" checked
+                class="accent-indigo-500" onchange="saveConvConfig()"> VLM (カメラ映像 + テキスト)
+            </label>
+          </div>
+          <div class="flex items-center gap-3">
             <label class="text-xs text-gray-400 w-24">ASR言語</label>
             <select id="asr-language" onchange="saveAsrLanguage()"
               class="bg-gray-700 border border-gray-600 rounded px-2 py-1 text-xs">
@@ -815,6 +822,7 @@ async function loadConvConfig() {
   try {
     const cfg = await apiCall('/api/conversation/config');
     document.getElementById('conv-timeout').value = cfg.timeout || 30;
+    document.getElementById('conv-use-camera').checked = cfg.use_camera !== false;
     _mcpServers = cfg.mcp_servers || [];
     _convActiveServers = cfg.conv_active_servers || [];
     _customActiveServers = [..._convActiveServers]; // init from saved
@@ -834,9 +842,10 @@ async function loadConvConfig() {
 
 async function saveConvConfig() {
   const timeout = parseInt(document.getElementById('conv-timeout').value) || 30;
+  const use_camera = document.getElementById('conv-use-camera').checked;
   await apiCall('/api/conversation/config', {
     method: 'POST',
-    body: JSON.stringify({ timeout, mcp_servers: _mcpServers, conv_active_servers: _convActiveServers }),
+    body: JSON.stringify({ timeout, mcp_servers: _mcpServers, conv_active_servers: _convActiveServers, use_camera }),
   });
 }
 
